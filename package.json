@@ -1,0 +1,10 @@
+{
+  "name": "firstmate-whatsapp-extension",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "test": "npm test --prefix bin/fm-whatsapp",
+    "check": "node --check bin/fm-whatsapp/core.mjs && node --check bin/fm-whatsapp/cli.mjs && node --check bin/fm-whatsapp/firstmate.mjs && bash -n bin/fm-whatsapp.sh bin/fm-whatsapp-events.sh",
+    "setup": "npm ci --ignore-scripts --prefix bin/fm-whatsapp"
+  }
+}
