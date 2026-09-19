@@ -66,11 +66,17 @@ export function validText(text) {
   return typeof text === 'string' && text.trim().length > 0 && text.length <= MAX_TEXT &&
     !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text);
 }
-export function authenticatedMessage(message, identity, now, pairedAt) {
+export function authenticatedMessage(message, identity, now, pairedAt, peer = null) {
   const key = message?.key;
-  if (!identity || key?.fromMe !== true || typeof key.id !== 'string' ||
+  if (!identity || key?.fromMe !== !peer || typeof key.id !== 'string' ||
       !/^[A-Za-z0-9_-]{1,128}$/.test(key.id)) return null;
-  const owns = jid => identity.aliases.includes(canonicalJid(jid));
+  const aliases = [...(peer ?? identity).aliases];
+  // remoteJidAlt is authenticated transport metadata, not quoted message text.
+  // A phone-number match can bind a LID before the background lookup completes.
+  if (peer && canonicalJid(key.remoteJidAlt) === peer.account && canonicalJid(key.remoteJid)?.endsWith('@lid')) {
+    aliases.push(canonicalJid(key.remoteJid));
+  }
+  const owns = jid => aliases.includes(canonicalJid(jid));
   if (!owns(key.remoteJid)) return null;
   for (const field of ['remoteJidAlt', 'participant', 'participantAlt']) {
     if (key[field] != null && !owns(key[field])) return null;
@@ -85,9 +91,10 @@ export function authenticatedMessage(message, identity, now, pairedAt) {
   const text = content.conversation ?? extended?.text;
   if (!validText(text) || text.startsWith(PREFIX)) return null;
   const context = extended?.contextInfo;
-  if (context?.participant && !owns(context.participant)) return null;
+  if (context?.participant && !owns(context.participant) &&
+      !(peer && identity.aliases.includes(canonicalJid(context.participant)))) return null;
   if (context?.remoteJid && !owns(context.remoteJid)) return null;
-  return { id: key.id, key: sha256(`${identity.account}\n${key.id}`), text,
+  return { id: key.id, key: sha256(`${identity.account}\n${peer ? `${peer.account}\n` : ''}${key.id}`), text,
     quotedId: typeof context?.stanzaId === 'string' ? context.stanzaId : null };
 }
 export function validateSnapshot(value) {
@@ -194,8 +201,8 @@ export class Store {
 }
 
 export class Bridge {
-  constructor({ store, inbox, status, events, send, clock = epoch }) {
-    Object.assign(this, { store, inbox, status, events, send, clock });
+  constructor({ store, inbox, status, events, send, peer = null, clock = epoch }) {
+    Object.assign(this, { store, inbox, status, events, send, peer, clock });
     this.identity = null;
     this.connected = false;
     this.snapshot = { afk: false, session: '', events: [] };
@@ -245,7 +252,7 @@ export class Bridge {
     if (!this.connected || batch?.type !== 'notify' || !Array.isArray(batch.messages)) return;
     // Stage every accepted message before a potentially failing Firstmate helper runs.
     for (const message of batch.messages.slice(0, 100)) {
-      const incoming = authenticatedMessage(message, this.identity, this.clock(), this.pairedAt);
+      const incoming = authenticatedMessage(message, this.identity, this.clock(), this.pairedAt, this.peer);
       if (!incoming || this.store.incoming(incoming.key) || this.store.sentByRemoteId(incoming.id)) continue;
       const file = this.store.file(`pending/${incoming.key}.json`);
       if (readJson(file)) continue;
@@ -322,7 +329,7 @@ export class Bridge {
       if (readJson(this.store.file(`sent/${file}`))) { fs.unlinkSync(location); continue; }
       this.lastSent = this.clock();
       try {
-        const delivered = await this.send(this.identity.account, `${PREFIX}${job.text}`, job.remoteId);
+        const delivered = await this.send((this.peer ?? this.identity).account, `${PREFIX}${job.text}`, job.remoteId);
         if (!delivered) throw new Error('unconfirmed send');
         writeJson(this.store.file(`sent/${file}`), { ...job, delivered: this.clock() });
         fs.unlinkSync(location);

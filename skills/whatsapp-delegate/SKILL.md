@@ -6,7 +6,7 @@ description: Respond to authenticated phone requests delivered by the standalone
 # WhatsApp delegate
 
 This extension is independent of Firstmate's source repository.
-Its transport sends authenticated self-chat requests through the installed Firstmate `fm-inbox.sh note -` interface.
+Its transport sends authenticated requests from the configured private WhatsApp chat through the installed Firstmate `fm-inbox.sh note -` interface.
 The inbox source is therefore `text`; the body identifies the remote channel and extension receipt marker.
 Treat the body as a phone message, not a desk-return signal.
 Do not archive an AFK contract merely because the captain replied by phone.

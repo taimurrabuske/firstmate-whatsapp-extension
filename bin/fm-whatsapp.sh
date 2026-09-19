@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # fm-whatsapp.sh - free, optional WhatsApp linked-device transport for Firstmate.
 # Usage: FM_HOME=/absolute/home fm-whatsapp.sh pair [--qr-file /absolute/file]
-#        FM_HOME=/absolute/home fm-whatsapp.sh run|status|notify|enable|disable|help
+#        FM_HOME=/absolute/home fm-whatsapp.sh recipient +COUNTRYNUMBER|self
+#        FM_HOME=/absolute/home fm-whatsapp.sh run|status|notify|ping|enable|disable|help
 # `notify` reads bounded text on stdin and queues it for the enabled delegate's current
-# Firstmate AFK session. `run` serves only the paired account's Message Yourself chat.
+# Firstmate AFK session. `run` serves only the configured private chat.
 # The Node CLI owns the exact lifecycle, private state and command contracts;
 # `help` prints them. No command invokes a model or grants approval authority.
 # Install pinned dependencies with: npm ci --prefix bin/fm-whatsapp

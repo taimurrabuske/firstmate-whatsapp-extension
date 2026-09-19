@@ -44,6 +44,30 @@ function message(text = '!fm note hello', key = {}, extra = {}) {
 }
 const batch = (...messages) => ({ type: 'notify', messages });
 
+test('configured second number accepts its incoming PN/LID chat and rejects self, strangers and echoes', async t => {
+  const f = fixture(t);
+  const peer = { account: '15555550999@s.whatsapp.net', aliases: ['15555550999@s.whatsapp.net', '9988@lid'] };
+  f.bridge.peer = peer;
+  const incoming = (key = {}, extra = {}) => message('!fm note hello', { id: 'REMOTE', remoteJid: peer.account, fromMe: false, ...key }, extra);
+  for (const key of [{ fromMe: true }, { remoteJid: identity.account }, { remoteJid: '777@s.whatsapp.net' },
+    { remoteJid: '9988@g.us' }, { remoteJidAlt: '777@s.whatsapp.net' }, { participant: identity.account }]) {
+    assert.equal(authenticatedMessage(incoming(key), identity, 1010, 1000, peer), null);
+  }
+  assert.ok(authenticatedMessage(incoming({ remoteJid: '9988@lid', remoteJidAlt: peer.account }), identity, 1010, 1000, peer));
+  assert.ok(authenticatedMessage(incoming({ remoteJid: '9988@lid', remoteJidAlt: peer.account }), identity, 1010, 1000,
+    { account: peer.account, aliases: [peer.account] }));
+  assert.equal(authenticatedMessage(incoming({ remoteJid: 'different@g.us', remoteJidAlt: peer.account }), identity, 1010, 1000, peer), null);
+  await f.bridge.receive(batch(incoming(), incoming({ remoteJid: '9988@lid' })));
+  assert.equal(f.calls.inbox.length, 1);
+  await f.bridge.flush();
+  assert.equal(f.calls.sent[0].jid, peer.account);
+  const reply = incoming({ id: 'REPLY' }, { message: { extendedTextMessage: { text: 'Understood',
+    contextInfo: { stanzaId: f.calls.sent[0].id, participant: identity.account } } } });
+  await f.bridge.receive(batch(reply));
+  assert.equal(f.calls.inbox.length, 2);
+  assert.match(f.calls.inbox[1].text, /Understood/);
+});
+
 test('only authenticated own PN/LID, private fromMe messages pass; names are irrelevant', () => {
   assert.equal(canonicalJid(user.id), identity.account);
   for (const jid of [identity.account, user.id, user.lid, '12345@lid']) {

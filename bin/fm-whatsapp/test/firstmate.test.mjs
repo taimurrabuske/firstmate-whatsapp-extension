@@ -124,3 +124,18 @@ test('existing real Firstmate inbox integration in an isolated home', { skip: !p
   await adapter.note(key, 'A real isolated inbox note, not a live captain message.');
   assert.equal(readJson(f.store.file(`handoffs/${key}.json`)).phase, 'handled');
 });
+
+test('recipient configuration requires an idle bridge and empty queues; never changes Firstmate', t => {
+  const f = fixture(t);
+  const cli = path.join(root, 'bin/fm-whatsapp/cli.mjs');
+  const run = value => spawnSync(process.execPath, [cli, 'recipient', value], { encoding: 'utf8',
+    env: { ...process.env, FM_HOME: f.home, FM_DELEGATE_STATE: f.state } });
+  assert.equal(run('+15555550999').status, 0);
+  assert.deepEqual(readJson(f.store.file('recipient.json')), { account: '15555550999@s.whatsapp.net' });
+  assert.equal(run('not-a-phone').status, 1);
+  const unlock = f.store.lock();
+  assert.equal(run('self').status, 1); unlock();
+  f.store.enqueue('pending message', { kind: 'reply', session: '' });
+  assert.equal(run('self').status, 1);
+  assert.deepEqual(fs.readdirSync(f.home), []);
+});

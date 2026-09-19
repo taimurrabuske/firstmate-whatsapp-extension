@@ -1,6 +1,6 @@
 # Firstmate WhatsApp extension
 
-A standalone, private extension for talking to Firstmate while away through WhatsApp's **Message yourself** conversation.
+A standalone, private extension for talking to Firstmate while away through WhatsApp, using either **Message yourself** or one explicitly selected second number.
 It adds no messaging API fees, paid gateway, or model calls.
 It uses the free unofficial [Baileys linked-device client](https://baileys.wiki/).
 The computer running Firstmate must stay online; existing agent and connectivity costs still apply.
@@ -34,6 +34,13 @@ Start the bridge and leave it running:
 ./bin/fm-whatsapp.sh run
 ```
 
+To use a second number, stop the bridge and run `./bin/fm-whatsapp.sh recipient +COUNTRYNUMBER` before starting it again.
+Only that number's incoming private messages will be accepted; messages from other contacts and outbound echoes are ignored.
+Use `recipient self` to restore Message yourself.
+Recipient changes require empty inbound and outbound queues so pending messages cannot silently move to another person.
+The phone number is stored only in private local state.
+After startup, `./bin/fm-whatsapp.sh ping` sends a connection-test greeting to the selected chat.
+
 In another terminal with the same environment, enable AFK notifications:
 
 ```bash
@@ -49,7 +56,7 @@ Firstmate retains hold-for-return behavior whenever a response is unavailable.
 
 ## Talk from your phone
 
-In WhatsApp's **Message yourself** chat:
+In the configured chat (Message yourself by default, or the chat with the linked account from your second number):
 
 - `!fm status` reads recorded fleet status without waking Firstmate.
 - `!fm note Please check the failing simulation` saves a request and wakes the existing supervisor.
@@ -88,7 +95,7 @@ The runtime can be supervised by an existing process manager using the same expl
 Do not launch a second copy against the same state directory.
 After an unclean shutdown, inspect a reported stale lock and confirm its process is gone before removing that lock directory.
 
-Inbound messages are accepted only from the authenticated account's own private chat.
+Inbound messages are accepted only from the selected private chat.
 Other contacts, groups, forwarded content, media, history, and arbitrary shell commands are ignored.
 Accepted requests are journaled before handing off to Firstmate.
 The adapter recovers already-published inbox notes instead of blindly submitting duplicates.
@@ -100,6 +107,8 @@ A remote-send/local-receipt crash can duplicate an outbound message.
 Offline queues retry, and questions from ended AFK sessions or resolved decisions expire.
 
 ## Validation
+
+This repository uses local validation only; GitHub Actions is disabled and no CI workflow is installed.
 
 ```bash
 npm run check

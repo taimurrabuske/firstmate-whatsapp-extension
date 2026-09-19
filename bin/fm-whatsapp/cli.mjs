@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { FirstmateAdapter } from './firstmate.mjs';
-import { Acknowledgements, Bridge, Store, readJson, writeJson, delegateState, verifyHomeBinding, epoch, MAX_TEXT, validateSnapshot } from './core.mjs';
+import { Acknowledgements, Bridge, Store, readJson, writeJson, delegateState, verifyHomeBinding, ownIdentity, canonicalJid, epoch, MAX_TEXT, validateSnapshot } from './core.mjs';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const help = `Usage: FM_HOME=/absolute/home bin/fm-whatsapp.sh <command>
   pair [--qr-file /absolute/file]  Display a QR (SVG when file ends .svg), exit after linking.
@@ -13,13 +13,15 @@ const help = `Usage: FM_HOME=/absolute/home bin/fm-whatsapp.sh <command>
   notify                         Queue stdin text for the enabled delegate's current AFK session.
   enable                         Opt in to alerts while Firstmate is away (requires live bridge).
   disable                        Disable alerts; preserve credentials and saved notes.
+  recipient +COUNTRYNUMBER|self   Select the one allowed chat (bridge must be stopped).
+  ping                           Queue a connection-test greeting to the selected chat.
   help                           Show this help.
 Requires Node >=20; install the pinned transport with npm ci --prefix bin/fm-whatsapp.
 FM_CODE_ROOT selects existing Firstmate scripts (default FM_HOME).
 FM_STATE_OVERRIDE selects Firstmate state only, never bridge credentials.
 Bridge records use FM_DELEGATE_STATE or XDG_STATE_HOME/firstmate-whatsapp/<home-hash>/whatsapp.
 Without XDG_STATE_HOME, ~/.local/state is used. State is bound to canonical FM_HOME.
-Only the paired account's Message Yourself conversation is accepted.
+Only the configured recipient's private conversation is accepted; default is Message Yourself.
 Commands: !fm status, !fm help, !fm note TEXT; replies to sent Firstmate messages become notes.
 Stop never logs the device out. Unlink it in WhatsApp's Linked devices when retiring it.
 Pending sends remain queued on failure; remote acceptance does not prove a human read.
@@ -42,13 +44,17 @@ export function safeHealth(state, now = epoch()) {
 }
 function parseArgs(argv) {
   const command = argv.shift() || 'help';
-  let qrFile;
+  let qrFile, recipient;
+  if (command === 'recipient' && argv.length === 1) {
+    recipient = argv.shift();
+    if (recipient !== 'self' && !/^\+[1-9]\d{7,14}$/.test(recipient)) throw new Error('use an international phone number');
+  }
   if (command === 'pair' && argv[0] === '--qr-file' && argv.length === 2) {
     qrFile = argv[1]; argv = [];
     if (!path.isAbsolute(qrFile)) throw new Error('QR file must be an absolute path');
   }
-  if (argv.length || !['pair', 'run', 'status', 'notify', 'enable', 'disable', 'help', '--help'].includes(command)) throw new Error('invalid command; use help');
-  return { command, qrFile };
+  if (argv.length || (command === 'recipient' && !recipient) || !['pair', 'run', 'status', 'notify', 'enable', 'disable', 'recipient', 'ping', 'help', '--help'].includes(command)) throw new Error('invalid command; use help');
+  return { command, qrFile, recipient };
 }
 export function qrSvg(code) {
   const size = code.getModuleCount(), edge = size + 8;
@@ -65,7 +71,7 @@ function writeQr(file, text) {
 }
 async function main(argv) {
   process.umask(0o077);
-  const { command, qrFile } = parseArgs(argv);
+  const { command, qrFile, recipient } = parseArgs(argv);
   if (command === 'help' || command === '--help') { process.stdout.write(help); return; }
   const home = process.env.FM_HOME;
   if (!home || !path.isAbsolute(home)) throw new Error('set FM_HOME to an absolute operational home');
@@ -76,6 +82,20 @@ async function main(argv) {
   if (!path.isAbsolute(firstmateState) || !path.isAbsolute(codeRoot)) throw new Error('Firstmate state and code root must be absolute');
   if (command === 'status') { process.stdout.write(`${JSON.stringify(safeHealth(state))}\n`); return; }
   const store = new Store(home, state);
+  if (command === 'recipient') {
+    const unlock = store.lock();
+    try {
+      if (store.records('outbox').length || store.records('pending').length) throw new Error('resolve queued messages before changing recipient');
+      writeJson(store.file('recipient.json'), { account: recipient === 'self' ? null : `${recipient.slice(1)}@s.whatsapp.net` });
+      process.stdout.write('recipient configured; start the bridge\n');
+    } finally { unlock(); }
+    return;
+  }
+  if (command === 'ping') {
+    if (!safeHealth(state).connected) throw new Error('bridge must be connected');
+    store.enqueue('Firstmate is connected to this number. Reply with !fm status to check the connection, or !fm note followed by your instruction.', { kind: 'reply', session: '' });
+    process.stdout.write('connection test queued\n'); return;
+  }
   if (command === 'enable' || command === 'disable') {
     if (command === 'enable' && !safeHealth(state).connected) throw new Error('bridge is not connected; run it before enabling');
     writeJson(store.file('enabled.json'), { enabled: command === 'enable' });
@@ -136,13 +156,25 @@ async function main(argv) {
       qrLevel = (await import('qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel.js')).default;
     } catch { throw new Error('transport dependency unavailable; run npm ci --prefix bin/fm-whatsapp'); }
     const auth = await useMultiFileAuthState(store.file('auth'));
-    if (command === 'run' && !auth.state.creds.registered) throw new Error('device is not linked; run pair first');
-    bridge = new Bridge({ store, events,
+    // QR pairing establishes creds.me; `registered` belongs to the separate
+    // phone-number pairing flow and can remain false after a successful QR link.
+    if (command === 'run') ownIdentity(auth.state.creds.me);
+    const recipientConfig = readJson(store.file('recipient.json'));
+    const peerAccount = recipientConfig?.account;
+    if (peerAccount && (!canonicalJid(peerAccount)?.endsWith('@s.whatsapp.net') || canonicalJid(peerAccount) !== peerAccount)) throw new Error('invalid recipient configuration');
+    const peer = peerAccount && peerAccount !== canonicalJid(auth.state.creds.me?.id) ? { account: peerAccount, aliases: [peerAccount] } : null;
+    bridge = new Bridge({ store, events, peer,
       inbox: (key, text) => adapter.note(key, text),
       status: () => adapter.status(),
       send: async (jid, text, messageId) => {
         if (!socket || stopped) return false;
-        const waiter = acknowledgements.register(messageId, bridge.identity);
+        // Resolve the recipient's authenticated PN/LID mapping before sending,
+        // so either form of server acknowledgement can be matched exactly.
+        if (bridge.peer) {
+          const lid = canonicalJid(await socket.signalRepository.lidMapping.getLIDForPN(bridge.peer.account));
+          if (lid?.endsWith('@lid') && !bridge.peer.aliases.includes(lid)) bridge.peer.aliases.push(lid);
+        }
+        const waiter = acknowledgements.register(messageId, bridge.peer ?? bridge.identity);
         try {
           const response = await socket.sendMessage(jid, { text }, { messageId });
           if (response?.key?.id !== messageId) throw new Error('unexpected local send identity');
@@ -207,7 +239,14 @@ async function main(argv) {
               await auth.saveCreds();
               log('device linked; run the bridge before enabling WhatsApp alerts');
               stop('paired; run bridge to receive messages');
-            } else { log('connected to the paired self-chat'); await bridge.refresh(); }
+            } else {
+              log('connected to the selected private chat');
+              if (bridge.peer) {
+                const lid = canonicalJid(await current.signalRepository.lidMapping.getLIDForPN(bridge.peer.account));
+                if (lid?.endsWith('@lid') && !bridge.peer.aliases.includes(lid)) bridge.peer.aliases.push(lid);
+              }
+              await bridge.refresh();
+            }
           });
         }
         if (update.connection === 'close') {
@@ -252,9 +291,9 @@ async function main(argv) {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main(process.argv.slice(2)).catch(() => {
+  main(process.argv.slice(2)).then(() => process.exit(0)).catch(() => {
     // Neither auth objects, QR data nor vendor errors are ever diagnostic output.
     process.stderr.write('fm-whatsapp: command failed; verify configuration, pairing and private bridge health (details omitted for privacy)\n');
-    process.exitCode = 1;
+    process.exit(1);
   });
 }
