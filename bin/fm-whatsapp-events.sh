@@ -26,7 +26,7 @@ fm_afk_contract_validate "$record" 1 || exit 1
 session="$(fm_afk_contract_read_field "$record" entered_epoch):$(fm_afk_contract_read_field "$record" confirmed_epoch)"
 rows=$(
   for meta in "$FM_AFK_CONTRACT_STATE"/*.meta; do
-    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
+    if [ ! -f "$meta" ] || [ -L "$meta" ]; then continue; fi
     task=${meta##*/}; task=${task%.meta}
     while IFS=$'\t' read -r key verb note || [ -n "$key" ]; do
       [ "$verb" = needs-decision ] || continue
