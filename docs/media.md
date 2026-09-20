@@ -29,7 +29,7 @@ Supported outgoing types are JPEG, PNG, WebP, PDF, plain text, CSV, and JSON. In
 {"schema":"fm-whatsapp-voice.v1","ffmpeg":"/absolute/path/to/ffmpeg","whisper":"/absolute/path/to/whisper-cli","model":"/absolute/private/path/to/ggml-model.bin","language":"en"}
 ```
 
-All three paths must be absolute local regular files; executables must have an execute bit, and symlinks are rejected. Install `ffmpeg` and build the free `whisper.cpp` `whisper-cli` separately. No model is ever downloaded, and no model API or paid gateway is used. Configuration is read only from private local state, not incoming text; the configured paths are operator arguments and are never echoed into phone chat, logs, or doctor output.
+All three paths must be absolute local regular files; executables must have an execute bit, and symlinks are rejected. Install `ffmpeg` and build the free `whisper.cpp` `whisper-cli` separately. Model downloads happen only through the explicit `voice-model install` command below, and no model API or paid gateway is used. Configuration is read only from private local state, not incoming text; the configured paths are operator arguments and are never echoed into phone chat, logs, or doctor output.
 
 `transcribeVoice` invokes both programs with `execFile` argument arrays (no shell), decodes mono 16 kHz audio capped at thirty minutes, bounds each subprocess's runtime (five minutes for ffmpeg decode, thirty minutes for whisper.cpp) and captured output, bounds decoded WAV and transcript size, and removes its private temporary directory in `finally`. It returns `{available:true,text}` or an intelligible `{available:false,message}`; command stderr and local secrets are not exposed. The original bounded private voice attachment remains available when transcription fails.
 
@@ -47,6 +47,23 @@ The caller remains responsible for durable deduplication before handoff, queuein
 
 Long voice transcripts remain in a private `.transcript.txt` file; when transcription succeeds, the inbox envelope presents the bounded preview explicitly as the user's authenticated instruction, with the full-transcript path first and delimited `Bounded transcript preview (start)`/`(end)` lines. The controller reads the full file. Failed transcription stays an explicit non-command result: the envelope carries only the failure message and the retained private attachment, never a transcript. Captions and media metadata are never treated as instructions. Use `voice-status` to inspect configuration. An installation can use a local English `base.en` model; no voice data is sent to a transcription service.
 
-### Reusing an installed Vocalinux model directory
+### Installing a model into this extension's private state
 
-An installed Vocalinux dictation app keeps standard ggml Whisper weights on disk (for example `~/.local/share/vocalinux/models/whispercpp/ggml-*.bin`) and those regular files are directly usable as the `voice-config set` model path. Local evidence from the installed package: its whisper.cpp runtime is embedded as `libwhisper.so` plus the `pywhispercpp` CPython extension inside its private virtualenv, its main process owns no listening TCP or unix socket (the only `LISTEN` socket in the family is its ibus helper's private text-injection socket), and its only DBus use is a session-bus availability probe. It therefore exposes no stable local daemon/socket/API for submitting audio to its RAM-resident model, and no adapter is built against its internals. Reusing a model file still loads a separate copy per transcription process, so RAM is not shared with the running app. Never stop, restart, or reconfigure that app from this extension; its keep-alive, models, and settings remain operator-owned. The standalone whisper.cpp fallback remains fully supported.
+This extension downloads and owns its own whisper.cpp ggml models; nothing from another installed speech application is reused, attached to, or required. A download happens only when an operator explicitly asks for one specific model, never automatically and never during `run`, pairing, or transcription:
+
+```bash
+./bin/fm-whatsapp.sh voice-model list
+./bin/fm-whatsapp.sh voice-model install base.en
+./bin/fm-whatsapp.sh voice-config set /absolute/path/to/ffmpeg /absolute/path/to/whisper-cli base.en [LANG]
+./bin/fm-whatsapp.sh voice-model remove base.en
+```
+
+`voice-model list` prints every supported model with its size, description, and installed state. The catalog keeps several models selectable; there is no single mandatory model, and operators choose the accuracy/memory trade-off themselves.
+
+`voice-model install NAME` streams one model over HTTPS (only HTTPS; redirects are followed only to further HTTPS targets) into a bounded temporary file inside the extension's private `whatsapp/models/` state directory, checks the exact declared byte count and the pinned sha256 manifest, and installs the file atomically with mode 600. Failures and checksum mismatches remove the temporary and change nothing; a corrupted existing install is replaced only after the replacement verifies. Re-installing a verified model is a no-op that downloads nothing.
+
+`voice-model remove NAME` deletes only that one model file from the private models directory. Removing a model that `voice.json` still references leaves the configuration in place but transcription fails closed until another model is selected; nothing is downloaded automatically.
+
+`voice-config set` accepts either an absolute local model path (unchanged, and hand-written private `voice.json` files stay supported) or the name of an installed catalog model, and stores the resolved private absolute path. Selecting a not-yet-installed name fails with guidance; it never triggers a download.
+
+Provenance: download URLs and the verification manifest follow the public whisper.cpp ggml model repository on Hugging Face (`ggerganov/whisper.cpp`) at the revision pinned in `bin/fm-whatsapp/model-store.mjs`. Each model's sha256 and byte size equal the LFS object header that repository publishes for the file at the pinned revision (verified against the Hugging Face API tree). The URL and manifest conventions were identified from the public upstream Vocalinux catalog (VocaHQ/vocalinux); no implementation code, runtime, state, or installed file from any other speech application is copied or reused. To refresh the catalog, verify new digests with the Hugging Face API at the new revision and update the pinned revision and digests together in one commit.

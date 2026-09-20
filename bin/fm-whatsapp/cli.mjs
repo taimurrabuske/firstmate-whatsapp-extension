@@ -9,6 +9,7 @@ import { FirstmateAdapter } from './firstmate.mjs';
 import { NotificationPolicy } from './notifications.mjs';
 import { stageAttachment, outboundContent, attachmentBytes } from './media.mjs';
 import { loadVoiceConfig, transcribeVoice, validateVoicePaths, VOICE_CONFIG_SCHEMA } from './voice.mjs';
+import { WHISPER_MODEL_CATALOG, catalogModels, installWhisperModel, removeWhisperModel, resolveCatalogModel } from './model-store.mjs';
 import { MediaIntake } from './media-intake.mjs';
 import { TelegramDelegate, telegramStore, telegramConfig, telegramConfigured, configureTelegram } from './telegram.mjs';
 import { Acknowledgements, Bridge, Store, readJson, writeJson, delegateState, verifyHomeBinding, ownIdentity, canonicalJid, authenticatedMessage, validText, parseRequest, epoch, MAX_TEXT, MAX_QUEUE, validateSnapshot } from './core.mjs';
@@ -27,6 +28,10 @@ const help = `Usage: FM_HOME=/absolute/home bin/fm-whatsapp.sh <command>
   voice-status                  Check the local offline transcription setup.
   voice-config set|inspect|remove
                                 Configure local ffmpeg, whisper.cpp, model, and language paths (see help below).
+  voice-model list              List supported whisper.cpp models and which are installed.
+  voice-model install NAME      Explicitly download supported model NAME over HTTPS into private
+                                state with pinned checksum verification.
+  voice-model remove NAME       Remove installed model NAME from private state.
   telegram-config <file> <id>    Pair optional fallback using a private token file and exact user ID.
   notify                         Queue stdin text for the enabled delegate's current AFK session.
   enable                         Opt in to alerts while Firstmate is away (requires live bridge).
@@ -41,8 +46,12 @@ Bridge records use FM_DELEGATE_STATE or XDG_STATE_HOME/firstmate-whatsapp/<home-
 Without XDG_STATE_HOME, ~/.local/state is used. State is bound to canonical FM_HOME.
 Only the configured recipient's private conversation is accepted; default is Message Yourself.
 Offline voice transcription: voice-config set FFMPEG WHISPER MODEL [LANGUAGE] accepts absolute local
-paths, validates executables and the model file, and writes private mode-600 state. voice-config inspect
-prints the validated setup; voice-config remove clears it. Models are never downloaded; see docs/media.md.
+paths or the name of an installed catalog model, validates executables and the model file, and writes
+private mode-600 state. voice-config inspect prints the validated setup; voice-config remove clears it.
+Model downloads never happen automatically: voice-model install NAME fetches one explicitly over HTTPS
+into this extension's private state, verifies it against a pinned checksum manifest, and installs it
+atomically with private permissions. Nothing from other installed speech applications is reused;
+see docs/media.md.
 Send instructions directly, without a prefix. Shortcuts: status, pending, blocked, decisions, last result, more, help.
 Stop never logs the device out. Unlink it in WhatsApp's Linked devices when retiring it.
 Pending sends remain queued on failure; remote acceptance does not prove a human read.
@@ -137,7 +146,7 @@ export function doctorReport({ home, env = process.env, extensionRoot = root,
       note(`private state ${directory} does not exist yet; pair creates it`);
       return finished();
     }
-    for (const name of ['', 'auth', 'outbox', 'sent', 'incoming', 'pending'].map(suffix => path.join(directory, suffix))) {
+    for (const name of ['', 'auth', 'outbox', 'sent', 'incoming', 'pending', 'models'].map(suffix => path.join(directory, suffix))) {
       const stat = lstatOrNull(name);
       if (!stat) continue;
       if (!stat.isDirectory() || stat.isSymbolicLink()) problem(`private state directory ${name} must be a regular directory, not a symlink`);
@@ -161,7 +170,7 @@ export function doctorReport({ home, env = process.env, extensionRoot = root,
     else if (canonicalJid(recipient.account) === recipient.account && recipient.account.endsWith('@s.whatsapp.net')) ok('a single second number is configured for this state');
     else problem('recipient configuration is invalid; stop the bridge and run recipient self or recipient +COUNTRYNUMBER');
     const voiceFile = path.join(directory, 'voice.json');
-    if (!lstatOrNull(voiceFile)) note('offline voice transcription is not configured; voice-config set enables local whisper.cpp (optional, never downloads a model)');
+    if (!lstatOrNull(voiceFile)) note('offline voice transcription is not configured; voice-model install fetches a supported whisper.cpp model explicitly and voice-config set enables local transcription (optional)');
     else if (loadVoiceConfig({ file: () => voiceFile }).available) ok('offline voice transcription configuration validates');
     else problem('voice.json is not a valid private transcription configuration; run voice-config inspect, then voice-config set to rewrite it');
     // Single-instance ownership: live versus stale, with recorded binding.
@@ -259,7 +268,7 @@ export function doctorReport({ home, env = process.env, extensionRoot = root,
 }
 export function parseArgs(argv) {
   const command = argv.shift() || 'help';
-  let qrFile, recipient, messageKey, progressState, attachmentFile, value, tokenFile, userId, voiceAction, voicePaths;
+  let qrFile, recipient, messageKey, progressState, attachmentFile, value, tokenFile, userId, voiceAction, voicePaths, voiceModelAction, voiceModelName;
   if (command === 'progress' && argv.length === 2) [messageKey, progressState] = argv.splice(0);
   if (command === 'reply-file' && argv.length === 2) [messageKey, attachmentFile] = argv.splice(0);
   if (['summary', 'preferences'].includes(command) && argv.length) value = argv.splice(0).join(' ');
@@ -272,6 +281,18 @@ export function parseArgs(argv) {
     } else if (action === 'inspect' || action === 'remove') {
       if (rest.length) throw new Error(`voice-config ${action} takes no arguments`);
       voiceAction = action;
+    }
+    argv = [];
+  }
+  if (command === 'voice-model' && argv.length) {
+    const [action, ...rest] = argv;
+    if (action === 'list') {
+      if (rest.length) throw new Error('voice-model list takes no arguments');
+      voiceModelAction = 'list';
+    } else if (action === 'install' || action === 'remove') {
+      if (rest.length !== 1 || !/^[a-z0-9._-]{1,64}$/.test(rest[0]))
+        throw new Error(`voice-model ${action} requires one supported model name; use voice-model list`);
+      voiceModelAction = action; voiceModelName = rest[0];
     }
     argv = [];
   }
@@ -290,9 +311,9 @@ export function parseArgs(argv) {
       (command === 'reply-file' && !path.isAbsolute(attachmentFile ?? '')) ||
       (command === 'summary' && !['status', 'pending', 'blocked', 'decisions', 'last result', 'more'].includes(value)) ||
       (command === 'preferences' && !value) || (command === 'telegram-config' && (!tokenFile || !userId)) ||
-      (command === 'voice-config' && !voiceAction) ||
-      !['pair', 'run', 'status', 'doctor', 'notify', 'reply', 'progress', 'reply-file', 'summary', 'preferences', 'voice-status', 'voice-config', 'telegram-config', 'enable', 'disable', 'recipient', 'ping', 'help', '--help'].includes(command)) throw new Error('invalid command; use help');
-  return { command, qrFile, recipient, messageKey, progressState, attachmentFile, value, tokenFile, userId, voiceAction, voicePaths };
+      (command === 'voice-config' && !voiceAction) || (command === 'voice-model' && !voiceModelAction) ||
+      !['pair', 'run', 'status', 'doctor', 'notify', 'reply', 'progress', 'reply-file', 'summary', 'preferences', 'voice-status', 'voice-config', 'voice-model', 'telegram-config', 'enable', 'disable', 'recipient', 'ping', 'help', '--help'].includes(command)) throw new Error('invalid command; use help');
+  return { command, qrFile, recipient, messageKey, progressState, attachmentFile, value, tokenFile, userId, voiceAction, voicePaths, voiceModelAction, voiceModelName };
 }
 export function qrSvg(code) {
   const size = code.getModuleCount(), edge = size + 8;
@@ -309,7 +330,7 @@ function writeQr(file, text) {
 }
 async function main(argv) {
   process.umask(0o077);
-  const { command, qrFile, recipient, messageKey, progressState, attachmentFile, value, tokenFile, userId, voiceAction, voicePaths } = parseArgs(argv);
+  const { command, qrFile, recipient, messageKey, progressState, attachmentFile, value, tokenFile, userId, voiceAction, voicePaths, voiceModelAction, voiceModelName } = parseArgs(argv);
   if (command === 'help' || command === '--help') { process.stdout.write(help); return; }
   const home = process.env.FM_HOME;
   if (!home || !path.isAbsolute(home)) throw new Error('set FM_HOME to an absolute operational home');
@@ -330,13 +351,38 @@ async function main(argv) {
   if (command === 'status') { process.stdout.write(`${JSON.stringify(safeHealth(state))}\n`); return; }
   const store = new Store(home, state);
   if (command === 'voice-status') { process.stdout.write(`${JSON.stringify(loadVoiceConfig(store))}\n`); return; }
+  if (command === 'voice-model') {
+    if (voiceModelAction === 'list') {
+      process.stdout.write(`${JSON.stringify(catalogModels(store))}\n`); return;
+    }
+    if (voiceModelAction === 'install') {
+      if (!Object.prototype.hasOwnProperty.call(WHISPER_MODEL_CATALOG, voiceModelName))
+        throw new Error('unsupported model; use voice-model list for the supported names');
+      const result = await installWhisperModel(voiceModelName, { store });
+      process.stdout.write(result.alreadyInstalled
+        ? 'model was already installed and verified; nothing downloaded\n'
+        : `model installed in private state after pinned sha256 verification (${Math.round(result.bytes / 1_000_000)} MB)\n`);
+      return;
+    }
+    const removed = removeWhisperModel(voiceModelName, { store });
+    process.stdout.write(removed.removed ? 'model removed from private state\n' : 'model was not installed\n');
+    return;
+  }
   if (command === 'voice-config') {
     if (voiceAction === 'set') {
       const [ffmpeg, whisper, model, language] = voicePaths;
+      // A bare catalog name selects an already-installed private model; absolute
+      // local paths keep working unchanged. Downloads stay explicit and separate.
+      let modelPath = model;
+      if (!path.isAbsolute(model)) {
+        if (!/^[a-z0-9._-]{1,64}$/.test(model)) throw new Error('voice model must be an absolute local path or an installed catalog model name; use voice-model list');
+        modelPath = resolveCatalogModel(store, model);
+        if (!modelPath) throw new Error('voice model is not installed; run voice-model install first');
+      }
       // Validation happens before any write: only a fully verified absolute local
       // setup replaces the private configuration, atomically and mode 600 via writeJson.
-      const resolved = validateVoicePaths({ ffmpeg, whisper, model, language: language ?? 'en' });
-      writeJson(store.file('voice.json'), { schema: VOICE_CONFIG_SCHEMA, ffmpeg, whisper, model, language: resolved.language });
+      const resolved = validateVoicePaths({ ffmpeg, whisper, model: modelPath, language: language ?? 'en' });
+      writeJson(store.file('voice.json'), { schema: VOICE_CONFIG_SCHEMA, ffmpeg, whisper, model: modelPath, language: resolved.language });
       process.stdout.write(`offline voice transcription configured (language ${resolved.language}); private voice.json written mode 600\n`);
       return;
     }
