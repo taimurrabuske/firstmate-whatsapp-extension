@@ -24,6 +24,10 @@ Crash-window and retry tests live in `bin/fm-whatsapp/test/outbound-delivery.tes
 
 `bin/fm-whatsapp/model-store.mjs` pins the supported whisper.cpp ggml catalog: Hugging Face `ggerganov/whisper.cpp` at a pinned revision, with per-file sha256 equal to the upstream LFS oid (see docs/media.md "Installing a model"). Refresh by re-verifying digests via the Hugging Face API at the new revision and updating revision and digests in one commit. Downloads are explicit operator commands only; model tests inject `fetchImpl` and must never touch the network.
 
+## Durable-state reads, quarantine, and retention
+
+Bucket-record scans use `readStoredRecord` (core.mjs): content damage (truncated JSON, oversize, symlink) or failed structural/schema validation quarantines the record byte-preserved under `whatsapp/quarantine/` via `quarantineFile` and reports it as absent, while I/O errors still fail closed. Deletion policy lives only in `bin/fm-whatsapp/retention.mjs` (`retainPrivateState`, 30-day horizon): only proven terminal artifacts (handled handoffs of terminal requests, terminal journal records, unreferenced aged attachments) are removed, while sent-receipt expiry stays in `Store.pruneSent`; configuration singletons stay fail-closed. Tests for this live in `bin/fm-whatsapp/test/retention.test.mjs`.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.

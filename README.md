@@ -227,6 +227,23 @@ Delivery receipts are retained for 24 hours like inbound receipts; within that w
 See [the outbound delivery journal](docs/delivery.md).
 Offline queues retry, and questions from ended AFK sessions or resolved decisions expire.
 
+### Damaged records are quarantined, never silently dropped
+
+Every record is written atomically (temporary file plus rename), so a record that later fails to parse, exceeds its size bound, is a symlink, or carries an incompatible future schema is treated as damage, not as empty state.
+Readers move such records byte-preserved into `whatsapp/quarantine/<bucket>/` with a `.meta.json` sidecar (origin, time, reason) and continue with the healthy siblings, so one poisoned record can never wedge the whole queue while nothing is destroyed.
+Open requests, uncertain handoffs, pending replies, and undelivered queue entries always survive; if one of them is quarantined, restore it by hand after inspection.
+`doctor` reports the quarantine contents and flags an unusually large quarantine as a problem.
+I/O errors (for example permissions) still fail closed instead of quarantining.
+
+### Bounded retention deletes only proven terminal artifacts
+
+The bridge's periodic sweep (`bin/fm-whatsapp/retention.mjs`) applies one explicit 30-day horizon:
+handled handoff receipts of terminal requests, terminal request records without unresolved handoffs, and attachment content nothing unresolved references are removed.
+Delivered send receipts expire separately through `Store.pruneSent` on their documented 24-hour boundary, which also keeps the receipt count cap honest.
+Open requests, `uncertain` handoffs, pending replies, undelivered queue entries, and quarantined records are never deleted by the sweep.
+Stale `.tmp` litter from interrupted atomic writes (older than an hour) is swept from queue buckets, never from `auth/`.
+Configuration and credential files (`identity.json`, `recipient.json`, `home.json`, `telegram.json`, notification preferences) stay fail-closed when damaged: the bridge refuses to guess and doctor points at the file.
+
 ## Validation
 
 This repository uses local validation only; GitHub Actions is disabled and no CI workflow is installed.

@@ -1,6 +1,6 @@
 // Journal encrypted media locators before asynchronous download/transcription.
 import fs from 'node:fs';
-import { readJson, writeJson, privateDirectory, epoch, sameRoute } from './core.mjs';
+import { readStoredRecord, writeJson, privateDirectory, epoch, sameRoute } from './core.mjs';
 import { authenticateMediaMetadata, authenticatedMediaMessage } from './media.mjs';
 
 // Only our own hidden artifacts match: staging temps are dot-prefixed .tmp files
@@ -52,8 +52,8 @@ export class MediaIntake {
       // Our own outbound media echo is transport feedback, never inbound intake.
       if (this.store.sentByRemoteId(message?.key?.id)) continue;
       const meta = authenticateMediaMetadata(message, this.bridge.identity, this.clock(), this.bridge.pairedAt, this.bridge.peer);
-      if (!meta || this.store.incoming(meta.key) || readJson(this.store.file(`pending/${meta.key}.json`)) ||
-          readJson(this.store.file(`media-pending/${meta.key}.json`))) continue;
+      if (!meta || this.store.incoming(meta.key) || readStoredRecord(this.store.root, this.store.file(`pending/${meta.key}.json`)).record ||
+          readStoredRecord(this.store.root, this.store.file(`media-pending/${meta.key}.json`)).record) continue;
       if (this.store.records('media-pending').length >= 100) throw new Error('media intake full');
       const encoded = Buffer.from(this.encode(message)).toString('base64');
       if (encoded.length > 131072) {
@@ -69,9 +69,9 @@ export class MediaIntake {
   async processOne() {
     if (!this.bridge.connected) return;
     for (const name of this.store.records('media-pending')) {
-      const file = this.store.file(`media-pending/${name}`), job = readJson(file);
-      if (!sameRoute(job.route, this.store.currentRoute()) || job.attempts >= 3 || job.next > this.clock()) continue;
-      if (this.store.incoming(job.key) || readJson(this.store.file(`pending/${job.key}.json`))) { fs.unlinkSync(file); continue; }
+      const file = this.store.file(`media-pending/${name}`), { record: job } = readStoredRecord(this.store.root, file);
+      if (!job || !sameRoute(job.route, this.store.currentRoute()) || job.attempts >= 3 || job.next > this.clock()) continue;
+      if (this.store.incoming(job.key) || readStoredRecord(this.store.root, this.store.file(`pending/${job.key}.json`)).record) { fs.unlinkSync(file); continue; }
       try {
         const message = this.decode(Buffer.from(job.encoded, 'base64'));
         if (this.store.sentByRemoteId(message.key?.id)) { fs.unlinkSync(file); continue; } // our own outbound echo
@@ -80,7 +80,7 @@ export class MediaIntake {
         if (!accepted) throw new Error('media no longer eligible');
         if (!this.bridge.connected) return; // Keep the durable locator for the next connected pass.
         this.bridge.stage({ type: 'notify', messages: [{ ...message, message: { conversation: accepted.text } }] });
-        if (!readJson(this.store.file(`pending/${job.key}.json`)) && !this.store.incoming(job.key)) throw new Error('media handoff not staged');
+        if (!readStoredRecord(this.store.root, this.store.file(`pending/${job.key}.json`)).record && !this.store.incoming(job.key)) throw new Error('media handoff not staged');
         fs.unlinkSync(file);
       } catch {
         job.attempts++; job.next = this.clock() + Math.min(300, 10 * 2 ** job.attempts);

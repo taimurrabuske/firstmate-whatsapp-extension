@@ -1,7 +1,7 @@
 // Optional, explicitly paired fallback. Tokens never enter queues or diagnostics.
 import fs from 'node:fs';
 import path from 'node:path';
-import { readJson, writeJson, privateDirectory, sha256, epoch, validText, parseRequest, PREFIX, sameRoute,
+import { readJson, readStoredRecord, queuedJobShape, writeJson, privateDirectory, sha256, epoch, validText, parseRequest, PREFIX, sameRoute, plainRecord,
   truncateText, outboundOrder, REMOTE_HELP } from './core.mjs';
 
 function tokenAt(file) {
@@ -130,7 +130,12 @@ export class TelegramDelegate {
       if (this.clock() - this.lastPoll >= 15) {
         this.lastPoll = this.clock();
         const cursorFile = this.store.file('telegram-cursor.json');
-        let cursor = readJson(cursorFile, { offset: 0, route: config.route });
+        // The cursor is derivable state: damaged or incompatible bytes are
+        // quarantined and polling restarts at the server's oldest pending
+        // update, with durable acceptance receipts preventing duplicates.
+        const stored = readStoredRecord(this.store.root, cursorFile,
+          { validate: value => Number.isInteger(value.offset) && plainRecord(value.route), reason: 'Telegram cursor failed structural validation' });
+        const cursor = stored.record ?? { offset: 0, route: config.route };
         if (!sameRoute(cursor.route, config.route)) {
           if (cursor.route.account !== config.route.account || cursor.route.recipient !== config.route.recipient) throw new Error('Telegram cursor belongs to another peer');
           cursor.route = config.route; // Same verified bot/user token rotation preserves consumed update offset.
@@ -150,8 +155,8 @@ export class TelegramDelegate {
         }
       }
       for (const name of this.store.records('telegram-pending').slice(0, 20)) {
-        const file = path.join(dir, name), job = readJson(file);
-        if (!sameRoute(job.route, config.route) || job.next > this.clock()) continue;
+        const file = path.join(dir, name), { record: job } = readStoredRecord(this.store.root, file);
+        if (!job || !sameRoute(job.route, config.route) || job.next > this.clock()) continue;
         try {
         const request = parseRequest(job.text);
         let response = job.response ?? await this.command(job.text, job.route);
@@ -189,12 +194,17 @@ export class TelegramDelegate {
         }
       }
       const offlineFile = this.store.file('telegram-offline.json');
-      const offline = readJson(offlineFile, { since: this.clock() });
+      const offline = readStoredRecord(this.store.root, offlineFile,
+        { validate: value => Number.isInteger(value.since), reason: 'Telegram offline marker failed structural validation' }).record ?? { since: this.clock() };
       if (whatsapp.connected) offline.since = this.clock();
       writeJson(offlineFile, offline);
       // Fallback delivery follows durable enqueue order, never hash order.
+      // Damaged or shape-incompatible entries are quarantined, never sent blind.
       const jobs = this.store.records('outbox')
-        .map(name => ({ name, job: readJson(this.store.file(`outbox/${name}`)) }))
+        .map(name => ({ name,
+          ...readStoredRecord(this.store.root, this.store.file(`outbox/${name}`),
+            { validate: queuedJobShape, reason: 'queued job failed structural validation' }) }))
+        .map(entry => ({ name: entry.name, job: entry.record }))
         .filter(entry => entry.job)
         .sort((a, b) => outboundOrder(a.job, b.job));
       const waitingFamilies = new Set();
@@ -211,7 +221,10 @@ export class TelegramDelegate {
            !sameRoute(job.fallbackRoute, config.route) || !sameRoute(config.whatsappRoute, this.store.currentRoute()) ||
            (job.route && !sameRoute(job.route, this.store.currentRoute())))) continue;
         if (job.kind === 'alert' && (!snapshot.afk || job.session !== snapshot.session || !this.notificationAllowed(job, snapshot, this.clock()))) continue;
-        if (readJson(this.store.file(`sent/${name}`))) { fs.unlinkSync(file); continue; }
+        // A damaged receipt also proves a completed send (writes are atomic);
+        // the queue entry retires instead of duplicating the message.
+        const delivered = readStoredRecord(this.store.root, this.store.file(`sent/${name}`));
+        if (delivered.record || delivered.quarantined) { fs.unlinkSync(file); continue; }
         let remoteId;
         try {
           // An unavailable staged attachment is an ordinary retryable send

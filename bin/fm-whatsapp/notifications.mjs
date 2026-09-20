@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { plainRecord, readStoredRecord } from './core.mjs';
 
 const KINDS = ['completion', 'failure', 'decision', 'progress'];
 const DEFAULTS = Object.freeze({
@@ -130,8 +131,15 @@ export class NotificationPolicy {
     const at = nowSeconds(now);
     if (!Number.isFinite(at)) throw new Error('invalid planning time');
     const preferences = this.preferences();
-    let ledger = read(this.ledgerFile, { schema: 'fm-whatsapp-notification-ledger.v1', initialized: false, session: '', seen: [], pending: {} });
-    if (ledger.schema !== 'fm-whatsapp-notification-ledger.v1' || !Array.isArray(ledger.seen) || !ledger.pending) throw new Error('invalid notification ledger');
+    // A damaged or incompatible ledger is quarantined and observation restarts
+    // fresh: no alert can duplicate because outbox/sent deduplication keys on
+    // the stable delivery id, and pending entries cannot survive unreadable
+    // bytes in any case. Preferences above deliberately stay fail-closed.
+    const stored = readStoredRecord(this.stateDir, this.ledgerFile,
+      { validate: value => value.schema === 'fm-whatsapp-notification-ledger.v1' && Array.isArray(value.seen) && plainRecord(value.pending),
+        reason: 'notification ledger failed structural validation or schema compatibility' });
+    const ledger = stored.record ??
+      { schema: 'fm-whatsapp-notification-ledger.v1', initialized: false, session: '', seen: [], pending: {} };
     const events = Array.isArray(snapshot?.events) ? snapshot.events.filter(eventValid) : [];
     if (events.some(event => event.text.length > 3500)) throw new Error('notification event exceeds 3500 characters');
     ledger.initialized = true;
@@ -220,7 +228,7 @@ export class NotificationPolicy {
   commit(delivery) {
     const ids = Array.isArray(delivery) ? delivery : delivery?.sourceIds;
     if (!Array.isArray(ids) || ids.some(id => typeof id !== 'string')) throw new Error('invalid notification acknowledgement');
-    const ledger = read(this.ledgerFile, null);
+    const ledger = readStoredRecord(this.stateDir, this.ledgerFile).record;
     if (!ledger) return;
     for (const id of ids) delete ledger.pending[id];
     write(this.ledgerFile, ledger);

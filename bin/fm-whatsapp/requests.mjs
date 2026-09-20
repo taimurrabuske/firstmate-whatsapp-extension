@@ -1,7 +1,7 @@
 // Durable, transport-neutral request lifecycle, bounded context, and summaries.
 import fs from 'node:fs';
 import crypto from 'node:crypto';
-import { privateDirectory, readJson, writeJson, sameRoute, validText, safeBoundaryEnd, MAX_TEXT } from './core.mjs';
+import { plainRecord, privateDirectory, readStoredRecord, writeJson, sameRoute, validText, safeBoundaryEnd, MAX_TEXT } from './core.mjs';
 
 export const REQUEST_STATES = ['received', 'picked-up', 'working', 'waiting', 'completed', 'failed'];
 export const TERMINAL_REQUEST_STATES = ['completed', 'failed'];
@@ -13,6 +13,13 @@ const transitions = {
   completed: new Set(), failed: new Set()
 };
 const validKey = key => typeof key === 'string' && /^[a-f0-9]{64}$/.test(key);
+// Compatibility gate: only records this version knows how to interpret stay in
+// the live journal. Truncated, damaged, or future-schema records are quarantined
+// byte-preserved by the reader instead of silently disappearing or wedging
+// every summary. Open work must be restored by an operator from quarantine.
+export const validRequestRecord = value => plainRecord(value) && value.schema === 'fm-remote-request.v1' &&
+  validKey(value.key) && REQUEST_STATES.includes(value.state) && Number.isFinite(value.received) &&
+  Number.isFinite(value.updated) && Array.isArray(value.history) && plainRecord(value.route);
 const clean = text => text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '').trim();
 // Recorded result and progress text is transport-agnostic journal history; it
 // accepts everything the reply stdin bound (MAX_TEXT * 4 bytes) can carry.
@@ -42,10 +49,14 @@ export class RequestJournal {
     privateDirectory(store.file('requests'));
   }
   file(key) { if (!validKey(key)) throw new Error('invalid request identity'); return this.store.file(`requests/${key}.json`); }
-  get(key) { return readJson(this.file(key)); }
+  get(key) {
+    return readStoredRecord(this.store.root, this.file(key),
+      { validate: validRequestRecord, reason: 'request record failed structural validation or schema compatibility' }).record;
+  }
   receive(key, { route, text, quoted = null, decision = null, provenance = 'whatsapp' }) {
     if (!validText(text)) throw new Error('invalid request text');
-    const file = this.file(key), existing = readJson(file);
+    const file = this.file(key), existing = readStoredRecord(this.store.root, file,
+      { validate: validRequestRecord, reason: 'request record failed structural validation or schema compatibility' }).record;
     const digest = crypto.createHash('sha256').update(text).digest('hex');
     const scope = routeScope(route, provenance);
     if (existing) {
@@ -65,7 +76,7 @@ export class RequestJournal {
   }
   transition(key, state, text = '') {
     if (!REQUEST_STATES.includes(state) || (text && !validRecordedText(text))) throw new Error('invalid request progress');
-    const file = this.file(key), record = readJson(file);
+    const record = this.get(key);
     if (!record) throw new Error('unknown request identity');
     if (record.state === state && (!text || record.history.at(-1)?.text === clean(text))) return record;
     if (record.state !== state && !transitions[record.state]?.has(state)) throw new Error(`invalid request transition from ${record.state}`);
@@ -76,12 +87,12 @@ export class RequestJournal {
       throw new Error(`request already ${record.state}; recorded result cannot change`);
     const now = this.clock(); record.state = state; record.updated = now;
     record.history = [...record.history, { state, at: now, ...(text ? { text: clean(text) } : {}) }].slice(-32);
-    writeJson(file, record); return record;
+    writeJson(this.file(key), record); return record;
   }
   list(route = null) {
     const scope = route ? routeScope(route) : null;
     return fs.readdirSync(this.store.file('requests')).filter(name => /^[a-f0-9]{64}\.json$/.test(name))
-      .map(name => readJson(this.store.file(`requests/${name}`))).filter(Boolean)
+      .map(name => this.get(name.slice(0, -5))).filter(Boolean)
       .filter(record => !route || (sameRoute(record.route, route) &&
         (record.routeScope ?? routeScope(record.route, record.provenance)) === scope))
       .sort((a, b) => b.updated - a.updated || a.key.localeCompare(b.key));
@@ -147,7 +158,11 @@ export class RequestJournal {
   summarize(command, route) {
     const lower = command.toLowerCase();
     if (lower === 'more') {
-      const cursor = readJson(this.cursorFile(route));
+      // A damaged pagination cursor loses only the reading position, never a
+      // recorded request; quarantine it and say so instead of failing forever.
+      const { record: cursor } = readStoredRecord(this.store.root, this.cursorFile(route),
+        { validate: value => value.kind === 'requests' || value.kind === 'text' || value.kind === 'done',
+          reason: 'summary cursor failed structural validation' });
       if (cursor?.kind === 'requests') return this.requestPage(cursor, route);
       if (cursor?.kind === 'text') return this.textPage(cursor, route);
       return 'No additional recorded summary page. Repeat a summary command to start again.';

@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
-import { privateDirectory, readJson, writeJson, sha256, sameRoute, epoch, validText, chunkText, MAX_TEXT } from './core.mjs';
+import { privateDirectory, readJson, readStoredRecord, writeJson, sha256, sameRoute, epoch, validText, chunkText, MAX_TEXT } from './core.mjs';
 import { RequestJournal, REQUEST_STATES } from './requests.mjs';
 
 export function execute(file, args, { env, input } = {}) {
@@ -103,7 +103,11 @@ export class FirstmateAdapter {
     const accepted = readJson(this.store.file(`pending/${key}.json`)) ?? this.store.incoming(key);
     const route = accepted?.operation === 'note' ? accepted.route : undefined;
     const binding = { home: fs.realpathSync(this.home), codeRoot: path.resolve(this.codeRoot), state: path.resolve(this.state) };
-    let receipt = readJson(receiptFile);
+    // A damaged receipt is quarantined; recovery then re-derives the envelope
+    // from the durable pending payload, and findNote() adopts the already
+    // published note or refuses a conflicting body, so nothing is republished
+    // blindly. An intact receipt keeps its exact uncertainty semantics.
+    let receipt = readStoredRecord(this.store.root, receiptFile).record;
     // Persist the exact envelope once so relocating/upgrading the extension cannot
     // alter a previously published note during recovery.
     const digest = sha256(text);
@@ -218,7 +222,9 @@ export class FirstmateAdapter {
   async maintain({ now = epoch(), staleAfter = 300, maxRings = 3 } = {}) {
     const reports = [], current = this.store.currentRoute();
     for (const name of fs.readdirSync(this.store.file('handoffs')).filter(x => /^[a-f0-9]{64}\.json$/.test(x))) {
-      const file = this.store.file(`handoffs/${name}`), receipt = readJson(file);
+      const file = this.store.file(`handoffs/${name}`);
+      // One damaged receipt must not silence maintenance for every other request.
+      const receipt = readStoredRecord(this.store.root, file).record;
       if (!receipt?.id || !['saved', 'handled'].includes(receipt.phase) || !sameRoute(receipt.route, current)) continue;
       const found = this.findNote(name.slice(0, -5), receipt.body);
       if (found?.handled) {

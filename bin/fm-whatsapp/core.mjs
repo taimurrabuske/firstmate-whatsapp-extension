@@ -80,6 +80,60 @@ export function readJson(file, fallback = null) {
     throw new Error('unreadable private state');
   }
 }
+export const plainRecord = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const queuedKey = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+// Shape every live enqueue/pending writer has produced since the first release.
+// Scans that act on these fields (flush expiry, delivery) refuse to act on a
+// record they cannot fully understand; it is quarantined instead.
+export const queuedJobShape = value => plainRecord(value) && (value.kind === 'alert' || value.kind === 'reply') &&
+  typeof value.text === 'string' && typeof value.session === 'string' && queuedKey(value.key) &&
+  Number.isInteger(value.attempts) && Number.isInteger(value.next) && Number.isInteger(value.created);
+const pendingJobShape = value => plainRecord(value) && queuedKey(value.key) && typeof value.operation === 'string' &&
+  Number.isInteger(value.attempts) && Number.isInteger(value.next);
+
+// Move a damaged or incompatible private record aside, byte-preserved and
+// mode-600, under <root>/quarantine/<bucket>/ with a metadata sidecar. Nothing
+// is ever deleted here; doctor surfaces the contents for operator inspection.
+export function quarantineFile(root, file, reason, { now = epoch() } = {}) {
+  const relative = path.relative(root, file);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('quarantine path escaped private store');
+  const bucket = path.dirname(relative);
+  const directory = path.join(root, 'quarantine', bucket === '.' ? 'root' : bucket);
+  privateDirectory(directory);
+  let target = path.join(directory, `${now}-${path.basename(file)}`);
+  if (fs.existsSync(target)) target = path.join(directory, `${now}-${crypto.randomBytes(4).toString('hex')}-${path.basename(file)}`);
+  fs.renameSync(file, target);
+  writeJson(`${target}.meta.json`, { schema: 'fm-whatsapp-quarantine.v1', at: now, origin: relative, reason });
+  return target;
+}
+
+// Read one bucket record for scanning loops. A record damaged after its atomic
+// write (truncated or foreign bytes) or one that fails structural/schema
+// validation is quarantined and reported as absent, so one poisoned record can
+// never wedge the whole queue. Genuine I/O trouble still fails closed, and an
+// absent file is indistinguishable from the previous ENOENT contract.
+export function readStoredRecord(root, file, { validate = null, reason = 'record failed structural validation', now = epoch() } = {}) {
+  let raw;
+  try {
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 2_000_000) throw new Error('unsafe state file');
+    raw = fs.readFileSync(file, 'utf8');
+  } catch (error) {
+    if (error.code === 'ENOENT') return { record: null };
+    if (error.message === 'unsafe state file')
+      return { record: null, quarantined: quarantineFile(root, file, 'unsafe state file (oversize, symlink, or non-regular)', { now }) };
+    throw error;
+  }
+  let value;
+  try { value = JSON.parse(raw); } catch {
+    return { record: null, quarantined: quarantineFile(root, file, 'malformed or truncated JSON record', { now }) };
+  }
+  // Without a validator the record must be a plain object; with one, the
+  // validator owns the shape decision (for example array receipt lists).
+  if (typeof value !== 'object' || value === null || (validate ? !validate(value) : !plainRecord(value)))
+    return { record: null, quarantined: quarantineFile(root, file, reason, { now }) };
+  return { record: value };
+}
 export function writeJson(file, value) {
   const temp = `${file}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`;
   const fd = fs.openSync(temp, 'wx', 0o600);
@@ -187,7 +241,7 @@ export class Store {
   }
   file(name) { return path.join(this.root, name); }
   records(name) { return fs.readdirSync(this.file(name)).filter(f => /^[a-f0-9]{64}\.json$/.test(f)).sort(); }
-  incoming(key) { return readJson(this.file(`incoming/${key}.json`)); }
+  incoming(key) { return readStoredRecord(this.root, this.file(`incoming/${key}.json`)).record; }
   markIncoming(key, now, request = {}) {
     writeJson(this.file(`incoming/${key}.json`), { at: now, operation: request.operation, route: request.route, fallbackRoute: request.fallbackRoute });
   }
@@ -201,7 +255,9 @@ export class Store {
   }
   pruneIncoming(now) {
     for (const file of this.records('incoming')) {
-      const record = readJson(this.file(`incoming/${file}`));
+      const { record } = readStoredRecord(this.root, this.file(`incoming/${file}`),
+        { validate: value => Number.isFinite(value.at), reason: 'incoming receipt without a valid acceptance time' });
+      if (!record) continue; // quarantined or already gone
       if (record.at < now - 86400) fs.unlinkSync(this.file(`incoming/${file}`));
     }
   }
@@ -229,7 +285,11 @@ export class Store {
     try {
       const key = sha256(`${kind}\n${session}\n${id}`);
       const target = this.file(`outbox/${key}.json`);
-      if (readJson(this.file(`sent/${key}.json`)) || readJson(target)) return key;
+      // A damaged receipt or queue entry still proves this logical message
+      // exists; its key is content-addressed, so deduplication stands.
+      const receipt = readStoredRecord(this.root, this.file(`sent/${key}.json`));
+      const queued = readStoredRecord(this.root, target);
+      if (receipt.record || receipt.quarantined || queued.record || queued.quarantined) return key;
       if (this.records('outbox').length >= MAX_QUEUE) throw new Error('outbound queue full');
       // Durable monotonic sequence under the queue lock keeps ordered content
       // (chunked replies, digest pages) in enqueue order across restarts.
@@ -256,7 +316,8 @@ export class Store {
     const active = new Set(snapshot.events.map(event => event.id));
     for (const name of this.records('outbox')) {
       const file = this.file(`outbox/${name}`);
-      const job = readJson(file);
+      // Expiry deletes; it must never act on a record it cannot fully read.
+      const { record: job } = readStoredRecord(this.root, file, { validate: queuedJobShape, reason: 'queued alert failed structural validation' });
       if (!job || job.kind !== 'alert') continue;
       let reason = '';
       if (!snapshot.afk || job.session !== snapshot.session) reason = 'away session ended or replaced';
@@ -264,7 +325,11 @@ export class Store {
         ? job.sourceEvents.some(event => event.kind === 'decision' && !active.has(event.id))
         : !active.has(job.eventId))) reason = 'recorded decision no longer open';
       if (!reason) continue;
-      const receipts = readJson(this.file('expired.json'), []);
+      // Expired-alert receipts are a bounded audit trail; damaged bytes are
+      // quarantined and the trail restarts rather than wedging every refresh.
+      const stored = readStoredRecord(this.root, this.file('expired.json'),
+        { validate: Array.isArray, reason: 'expired receipt list failed structural validation' });
+      const receipts = stored.record ?? [];
       receipts.push({ key: job.key, at: now, reason });
       writeJson(this.file('expired.json'), receipts.slice(-MAX_QUEUE));
       fs.unlinkSync(file);
@@ -273,8 +338,8 @@ export class Store {
   sentByRemoteId(id) {
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(id ?? '')) return null;
     for (const name of this.records('sent')) {
-      const record = readJson(this.file(`sent/${name}`));
-      if (record.remoteId === id) return record;
+      const { record } = readStoredRecord(this.root, this.file(`sent/${name}`));
+      if (record?.remoteId === id) return record;
     }
     return null;
   }
@@ -330,7 +395,7 @@ export class Bridge {
   }
   health() {
     const pending = this.store.records('pending');
-    const uncertain = pending.filter(name => readJson(this.store.file(`pending/${name}`))?.uncertain === true).length;
+    const uncertain = pending.filter(name => readStoredRecord(this.store.root, this.store.file(`pending/${name}`)).record?.uncertain === true).length;
     writeJson(this.store.file('health.json'), { connected: this.connected, updated_epoch: this.clock(),
       account: this.identity?.account ?? '',
       problem: uncertain ? 'note publication uncertain; inspect handoff receipt, helper process and pending/handled inbox before recovery' : this.problem,
@@ -366,7 +431,10 @@ export class Bridge {
       const incoming = authenticatedMessage(message, this.identity, this.clock(), this.pairedAt, this.peer);
       if (!incoming || this.store.incoming(incoming.key) || this.store.sentByRemoteId(incoming.id)) continue;
       const file = this.store.file(`pending/${incoming.key}.json`);
-      if (readJson(file)) continue;
+      // A damaged pending entry is quarantined by the scan below; re-deriving
+      // from the authenticated message stays safe because findNote() refuses
+      // to republish a saved note with different text.
+      if (readStoredRecord(this.store.root, file).record) continue;
       const request = parseRequest(incoming.text);
       if (!request) continue;
       const operation = request.operation;
@@ -419,7 +487,8 @@ export class Bridge {
     let attempted = 0;
     for (const name of this.store.records('pending')) {
       const file = this.store.file(`pending/${name}`);
-      const job = readJson(file);
+      const { record: job } = readStoredRecord(this.store.root, file, { validate: pendingJobShape, reason: 'pending job failed structural validation' });
+      if (!job) continue; // quarantined, already gone, or unprocessable
       if (this.store.incoming(job.key)) { fs.unlinkSync(file); continue; }
       if (job.next > this.clock()) continue;
       if (++attempted > 20) break;
@@ -457,8 +526,13 @@ export class Bridge {
     try { gate = validateSnapshot(await this.events()); this.store.expire(gate, this.clock()); }
     catch { this.problem = 'event source unavailable; alerts remain queued'; gate = { afk: false }; }
     // Delivery follows durable enqueue order, never outbox filename hash order.
+    // Damaged or shape-incompatible entries are quarantined, never delivered
+    // blind, and never wedge their siblings.
     const jobs = this.store.records('outbox')
-      .map(name => ({ name, job: readJson(this.store.file(`outbox/${name}`)) }))
+      .map(name => ({ name,
+        ...readStoredRecord(this.store.root, this.store.file(`outbox/${name}`),
+          { validate: queuedJobShape, reason: 'queued job failed structural validation' }) }))
+      .map(entry => ({ name: entry.name, job: entry.record }))
       .filter(entry => entry.job)
       .sort((a, b) => outboundOrder(a.job, b.job));
     // A waiting part holds later parts of the same logical message so retries
@@ -480,8 +554,11 @@ export class Bridge {
       if (this.store.records('sent').length >= MAX_SEEN) {
         this.problem = 'delivery receipt limit reached; inspect private state'; this.health(); return;
       }
-      // A receipt written before queue deletion recovers without another remote send.
-      if (readJson(this.store.file(`sent/${name}`))) { fs.unlinkSync(location); continue; }
+      // A receipt written before queue deletion recovers without another remote
+      // send. Damaged receipt bytes also prove a completed send (writes are
+      // atomic), so the queue entry retires instead of duplicating the message.
+      const deliveredReceipt = readStoredRecord(this.store.root, this.store.file(`sent/${name}`));
+      if (deliveredReceipt.record || deliveredReceipt.quarantined) { fs.unlinkSync(location); continue; }
       this.lastSent = this.clock();
       try {
         const delivered = await this.send((this.peer ?? this.identity).account, `${PREFIX}${job.text}`, job.remoteId, job);

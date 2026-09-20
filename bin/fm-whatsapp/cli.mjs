@@ -11,6 +11,7 @@ import { stageAttachment, outboundContent, attachmentBytes } from './media.mjs';
 import { loadVoiceConfig, transcribeVoice, validateVoicePaths, VOICE_CONFIG_SCHEMA } from './voice.mjs';
 import { WHISPER_MODEL_CATALOG, catalogModels, installWhisperModel, removeWhisperModel, resolveCatalogModel } from './model-store.mjs';
 import { MediaIntake } from './media-intake.mjs';
+import { QUARANTINE_INSPECTION_LIMIT, quarantineSummary, retainPrivateState } from './retention.mjs';
 import { TelegramDelegate, telegramStore, telegramConfig, telegramConfigured, configureTelegram } from './telegram.mjs';
 import { Acknowledgements, Bridge, Store, readJson, writeJson, delegateState, verifyHomeBinding, ownIdentity, canonicalJid, authenticatedMessage, validText, parseRequest, epoch, MAX_TEXT, MAX_QUEUE, validateSnapshot } from './core.mjs';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -169,6 +170,12 @@ export function doctorReport({ home, env = process.env, extensionRoot = root,
     if (!recipient?.account) ok('recipient defaults to Message yourself');
     else if (canonicalJid(recipient.account) === recipient.account && recipient.account.endsWith('@s.whatsapp.net')) ok('a single second number is configured for this state');
     else problem('recipient configuration is invalid; stop the bridge and run recipient self or recipient +COUNTRYNUMBER');
+    const quarantine = quarantineSummary(directory);
+    if (quarantine.records > 0) {
+      const detail = `quarantine holds ${quarantine.records} preserved record(s) (${quarantine.bytes} bytes) under ${path.join(directory, 'quarantine')}; damaged records are never silently dropped`;
+      if (quarantine.records > QUARANTINE_INSPECTION_LIMIT) problem(`${detail}; inspect, repair or discard each one manually`);
+      else note(`${detail}; inspect before discarding, and restore any record this bridge still needs`);
+    }
     const voiceFile = path.join(directory, 'voice.json');
     if (!lstatOrNull(voiceFile)) note('offline voice transcription is not configured; voice-model install fetches a supported whisper.cpp model explicitly and voice-config set enables local transcription (optional)');
     else if (loadVoiceConfig({ file: () => voiceFile }).available) ok('offline voice transcription configuration validates');
@@ -670,6 +677,10 @@ async function main(argv) {
             const reports = await adapter.maintain();
             for (const report of reports) adapter.notifyMaintenance(report);
             if (optionalTelegram()) for (const report of await tgAdapter.maintain()) tgAdapter.notifyMaintenance(report);
+            // Bounded retention of proven terminal artifacts; failures leave
+            // everything in place and simply retry on a later tick.
+            try { retainPrivateState(store, bridge.requests, { now: epoch() }); }
+            catch { log('retention sweep skipped; private state retained unchanged'); }
           }
           if (!mediaWork) mediaWork = intake.processOne().catch(() => {
             bridge.problem = 'media processing unavailable; private intake retained';

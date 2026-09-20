@@ -6,7 +6,7 @@
   "scripts": {
     "test": "npm test --prefix bin/fm-whatsapp && node --test test/*.test.mjs",
     "doctor": "node bin/fm-whatsapp/cli.mjs doctor",
-    "check": "node --check bin/fm-whatsapp/cli.mjs && node --check bin/fm-whatsapp/core.mjs && node --check bin/fm-whatsapp/firstmate.mjs && node --check bin/fm-whatsapp/media-intake.mjs && node --check bin/fm-whatsapp/media.mjs && node --check bin/fm-whatsapp/model-store.mjs && node --check bin/fm-whatsapp/notifications.mjs && node --check bin/fm-whatsapp/requests.mjs && node --check bin/fm-whatsapp/telegram.mjs && node --check bin/fm-whatsapp/voice.mjs && node --check adapter/bin/firstmate-extension.mjs && bash -n bin/fm-whatsapp.sh bin/fm-whatsapp-events.sh bin/fm-whatsapp-decisions.sh",
+    "check": "node --check bin/fm-whatsapp/cli.mjs && node --check bin/fm-whatsapp/core.mjs && node --check bin/fm-whatsapp/firstmate.mjs && node --check bin/fm-whatsapp/media-intake.mjs && node --check bin/fm-whatsapp/media.mjs && node --check bin/fm-whatsapp/model-store.mjs && node --check bin/fm-whatsapp/notifications.mjs && node --check bin/fm-whatsapp/requests.mjs && node --check bin/fm-whatsapp/retention.mjs && node --check bin/fm-whatsapp/telegram.mjs && node --check bin/fm-whatsapp/voice.mjs && node --check adapter/bin/firstmate-extension.mjs && bash -n bin/fm-whatsapp.sh bin/fm-whatsapp-events.sh bin/fm-whatsapp-decisions.sh",
     "setup": "npm ci --ignore-scripts --prefix bin/fm-whatsapp"
   }
 }
