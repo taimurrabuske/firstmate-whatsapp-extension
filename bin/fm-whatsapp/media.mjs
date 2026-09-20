@@ -212,7 +212,9 @@ export async function authenticatedMediaMessage(message, identity, now, pairedAt
     if (result?.available) {
       const transcript = store.file(`attachments/incoming/${attachment.digest}.transcript.txt`);
       fs.writeFileSync(transcript, result.text, { mode: 0o600 });
-      detail = `\nFull offline transcript (read completely): ${transcript}\nTranscript preview:\n${result.text.slice(0, 2200)}`;
+      detail = `\nAuthenticated instruction (local whisper.cpp transcript of this voice note; the paired phone's spoken note text, delivered without any caption):\n` +
+        `Full private transcript (read completely): ${transcript}\n` +
+        `Bounded transcript preview (start):\n${result.text.slice(0, 2200)}\nBounded transcript preview (end).`;
     } else detail = `\n${result?.message || 'Voice transcription unavailable.'}`;
   }
   const label = metadata.kind === 'voice' ? 'voice note' : metadata.kind;

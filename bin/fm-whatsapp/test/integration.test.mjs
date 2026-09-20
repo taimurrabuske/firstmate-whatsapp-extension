@@ -10,6 +10,7 @@ import { NotificationPolicy } from '../notifications.mjs';
 import { MediaIntake } from '../media-intake.mjs';
 import { FirstmateAdapter } from '../firstmate.mjs';
 import { outboundContent } from '../media.mjs';
+import { loadVoiceConfig, transcribeVoice, VOICE_CONFIG_SCHEMA } from '../voice.mjs';
 
 function fixture(t) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'fm-seams-'));
@@ -66,6 +67,84 @@ test('media intake survives restart, rejects other numbers before download, and 
   const replay = new MediaIntake(options);
   replay.stage({ type: 'notify', messages: [candidate(f.peer.account)] }); await replay.processOne();
   assert.equal(downloads, 1); assert.equal(f.store.records('media-pending').length, 0);
+});
+
+function voiceFixture(t, f) {
+  const bin = name => { const file = path.join(f.home, name); fs.writeFileSync(file, '#!/bin/false\n', { mode: 0o700 }); return file; };
+  const config = { schema: VOICE_CONFIG_SCHEMA, ffmpeg: bin('ffmpeg'), whisper: bin('whisper-cli'),
+    model: path.join(f.home, 'model.bin'), language: 'en' };
+  fs.writeFileSync(config.model, 'fake model', { mode: 0o600 });
+  writeJson(f.store.file('voice.json'), config);
+  const loaded = loadVoiceConfig(f.store);
+  assert.equal(loaded.available, true);
+  return loaded;
+}
+function voiceMessage(f, id, seconds = 30, caption) {
+  return { key: { id, remoteJid: f.peer.account, fromMe: false }, messageTimestamp: 1011,
+    message: { audioMessage: { mimetype: 'audio/ogg; codecs=opus', fileLength: 13, seconds, ptt: true, ...(caption ? { caption } : {}) } } };
+}
+function voiceIntake(f, bridge, run) {
+  return { store: f.store, bridge, clock: () => 1015, encode: x => Buffer.from(JSON.stringify(x)),
+    decode: x => JSON.parse(x.toString()), download: async () => Buffer.from('OggSvoicenote'),
+    transcribe: file => transcribeVoice(file, { store: f.store, run }) };
+}
+
+test('a transcribed voice note carries the authenticated instruction end to end without any caption', async t => {
+  const f = fixture(t), notes = [];
+  const config = voiceFixture(t, f);
+  const transcriptText = 'Pause the build lane, then summarize the failing test.';
+  const run = async (file, args) => {
+    if (file === config.ffmpeg) fs.writeFileSync(args.at(-1), 'RIFFwav');
+    else fs.writeFileSync(`${args[args.indexOf('-of') + 1]}.txt`, `${transcriptText}\n`);
+    return { stdout: '', stderr: '' };
+  };
+  const bridge = new Bridge({ store: f.store, peer: f.peer, clock: () => 1010,
+    events: async () => ({ schema: 'fm-whatsapp-events.v1', afk: false, session: '', events: [] }),
+    inbox: async (_key, text) => notes.push(text), status: async () => '', send: async () => true });
+  bridge.connect(f.user);
+  const options = voiceIntake(f, bridge, run);
+  new MediaIntake(options).stage({ type: 'notify',
+    messages: [voiceMessage(f, 'VOICE1', 30, 'caption text is never a command')] });
+  await new MediaIntake(options).processOne(); await bridge.processPending();
+  assert.equal(notes.length, 1);
+  const note = notes[0];
+  assert.match(note, /Authenticated instruction \(local whisper\.cpp transcript of this voice note/);
+  assert.match(note, /Pause the build lane, then summarize the failing test\./);
+  assert.ok(!note.includes('caption text is never a command'));
+  assert.ok(note.length <= 3500);
+  const transcriptFile = /Full private transcript \(read completely\): (.+)$/m.exec(note)?.[1];
+  assert.equal(fs.readFileSync(transcriptFile, 'utf8'), transcriptText);
+  assert.equal(fs.statSync(transcriptFile).mode & 0o777, 0o600);
+  assert.equal(f.store.records('media-pending').length, 0);
+  // Redelivery of the same voice note is deduplicated; the transcript is delivered once.
+  new MediaIntake(options).stage({ type: 'notify', messages: [voiceMessage(f, 'VOICE1', 30)] });
+  await new MediaIntake(options).processOne(); await bridge.processPending();
+  assert.equal(notes.length, 1);
+});
+
+test('failed voice transcription delivers an explicit non-command result and keeps the note private', async t => {
+  const f = fixture(t), notes = [];
+  const config = voiceFixture(t, f);
+  const run = async (file, args) => {
+    if (file === config.ffmpeg) { fs.writeFileSync(args.at(-1), 'RIFFwav'); return { stdout: '', stderr: '' }; }
+    throw new Error('secret whisper stderr');
+  };
+  const bridge = new Bridge({ store: f.store, peer: f.peer, clock: () => 1010,
+    events: async () => ({ schema: 'fm-whatsapp-events.v1', afk: false, session: '', events: [] }),
+    inbox: async (_key, text) => notes.push(text), status: async () => '', send: async () => true });
+  bridge.connect(f.user);
+  const options = voiceIntake(f, bridge, run);
+  new MediaIntake(options).stage({ type: 'notify', messages: [voiceMessage(f, 'VOICE2')] });
+  await new MediaIntake(options).processOne(); await bridge.processPending();
+  assert.equal(notes.length, 1);
+  assert.match(notes[0], /Voice transcription failed locally/);
+  assert.ok(!notes[0].includes('Authenticated instruction'));
+  assert.ok(!notes[0].includes('.transcript.txt'));
+  assert.ok(!notes[0].includes('secret'));
+  // The original bounded private voice attachment remains available for inspection.
+  const kept = fs.readdirSync(f.store.file('attachments/incoming')).filter(n => !n.endsWith('.json'));
+  assert.equal(kept.length, 1); assert.ok(fs.statSync(f.store.file(`attachments/incoming/${kept[0]}`)).size > 0);
+  assert.equal(f.store.records('media-pending').length, 0);
 });
 
 test('maintenance reuses the captured process-event wake and never re-rings explicitly working requests', async t => {

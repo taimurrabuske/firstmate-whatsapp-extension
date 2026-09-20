@@ -131,4 +131,20 @@ test('long local voice transcripts remain complete on disk with a bounded inbox 
   const file = `${result.attachment.path}.transcript.txt`;
   assert.equal(fs.readFileSync(file, 'utf8'), transcript);
   assert.ok(result.text.includes(file)); assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  assert.match(result.text, /Authenticated instruction \(local whisper\.cpp transcript/);
+  assert.ok(result.text.indexOf(file) < result.text.indexOf('Bounded transcript preview (start)'));
+  assert.ok(result.text.includes(`Bounded transcript preview (start):\n${transcript.slice(0, 2200)}`));
+  assert.match(result.text, /Bounded transcript preview \(end\)\.$/);
+});
+
+test('a transcribed voice note is delivered as the authenticated instruction and captions stay inert', async t => {
+  const { store } = fixture(t), bytes = Buffer.from('OggSvoice');
+  const message = media({ mimetype: 'audio/ogg', fileLength: bytes.length, seconds: 30, ptt: true,
+    caption: 'caption must never become a command' }, {}, 'audioMessage');
+  const result = await authenticatedMediaMessage(message, identity, 1010, 1000, null,
+    { store, download: async () => bytes, transcribe: async () => ({ available: true, text: 'pause the build lane' }) });
+  assert.ok(result.text.startsWith('WhatsApp voice note received (remote; away mode unchanged).\nLocal attachment:'));
+  assert.match(result.text, /pause the build lane/);
+  assert.ok(!result.text.includes('caption must never become a command'));
+  assert.ok(result.text.length <= 3500);
 });
