@@ -3,6 +3,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+import { spawnSync } from 'node:child_process';
 import { FirstmateAdapter } from './firstmate.mjs';
 import { NotificationPolicy } from './notifications.mjs';
 import { stageAttachment, outboundContent, attachmentBytes } from './media.mjs';
@@ -15,6 +17,7 @@ const help = `Usage: FM_HOME=/absolute/home bin/fm-whatsapp.sh <command>
   pair [--qr-file /absolute/file]  Display a QR (SVG when file ends .svg), exit after linking.
   run                            Run the self-chat bridge until stopped with SIGINT/SIGTERM.
   status                         Print private bridge health without connecting.
+  doctor                         Verify installation, dependencies, private state, and single-instance readiness.
   reply <message-key>            Queue stdin response to an accepted phone request, including outside AFK.
   progress <key> <state>         Report picked-up, working, waiting, or failed; detail on stdin.
   reply-file <key> <file>        Send a local image/report for this request; optional caption on stdin.
@@ -54,6 +57,110 @@ export function safeHealth(state, now = epoch()) {
     pending: data?.pending ?? 0, uncertain: data?.uncertain ?? 0,
     problem: fresh ? (data.problem || '') : 'bridge is not running or health is stale' };
 }
+function lstatOrNull(file) { try { return fs.lstatSync(file); } catch { return null; } }
+function resolveTransport(extensionRoot) {
+  const requireModule = createRequire(path.join(extensionRoot, 'bin/fm-whatsapp', 'package.json'));
+  for (const name of ['@whiskeysockets/baileys', 'qrcode-terminal']) {
+    try { requireModule.resolve(name); } catch { return false; }
+  }
+  return true;
+}
+function jqInstalled() {
+  try { return spawnSync('jq', ['--version'], { timeout: 10000 }).status === 0; } catch { return false; }
+}
+// Read-only installation diagnostics for operators and process managers.
+// Injected probes keep the checks hermetic for tests; defaults inspect the real
+// installation. Findings never include phone numbers or credentials.
+export function doctorReport({ home, env = process.env, extensionRoot = root,
+  nodeMajor = Number(process.versions.node.split('.')[0]),
+  transportReady = resolveTransport(root), jqReady = jqInstalled(),
+  processAlive = pid => { process.kill(pid, 0); } } = {}) {
+  const lines = [];
+  const missing = [];
+  const ok = detail => lines.push(`ok: ${detail}`);
+  const note = detail => lines.push(`note: ${detail}`);
+  const problem = detail => lines.push(`problem: ${detail}`);
+  const finished = () => ({ ready: !lines.some(line => line.startsWith('problem:')), lines });
+  try {
+    if (nodeMajor >= 20) ok(`node major version ${nodeMajor} satisfies the required >= 20`);
+    else problem(`node major version ${nodeMajor} is present but Node >= 20 is required; install a newer Node`);
+    if (transportReady) ok('pinned WhatsApp transport dependencies resolve (Baileys, qrcode-terminal)');
+    else problem(`WhatsApp transport dependencies are missing; run npm ci --prefix ${path.join(extensionRoot, 'bin/fm-whatsapp')}`);
+    if (jqReady) ok('jq is installed for Firstmate event and decision projections');
+    else problem('jq is missing; install jq so status summaries and AFK alert projections work');
+    const codeRoot = env.FM_CODE_ROOT || home;
+    if (lstatOrNull(path.join(codeRoot, 'bin/fm-afk-contract.sh'))) ok(`Firstmate scripts are installed under ${codeRoot}`);
+    else problem(`Firstmate helper fm-afk-contract.sh is not installed under ${codeRoot}; set FM_CODE_ROOT to the installed Firstmate home`);
+    for (const script of ['bin/fm-whatsapp-events.sh', 'bin/fm-whatsapp-decisions.sh']) {
+      if (!lstatOrNull(path.join(extensionRoot, script))) missing.push(script);
+    }
+    if (missing.length) problem(`extension projection scripts missing from ${extensionRoot}: ${missing.join(', ')}; use a complete checkout`);
+    else ok('extension projection scripts are present');
+    let state = null;
+    try { state = delegateState(home, env); }
+    catch (error) {
+      if (error?.code === 'ENOENT') problem(`FM_HOME ${home} does not exist; create the home or correct the path`);
+      else problem(`private state location cannot be resolved: ${error.message}`);
+    }
+    if (!state) return finished();
+    const directory = path.join(state, 'whatsapp');
+    if (!lstatOrNull(directory)) {
+      note(`private state ${directory} does not exist yet; pair creates it`);
+      return finished();
+    }
+    for (const name of ['', 'auth', 'outbox', 'sent', 'incoming', 'pending'].map(suffix => path.join(directory, suffix))) {
+      const stat = lstatOrNull(name);
+      if (!stat) continue;
+      if (!stat.isDirectory() || stat.isSymbolicLink()) problem(`private state directory ${name} must be a regular directory, not a symlink`);
+      else if ((stat.mode & 0o777) !== 0o700) problem(`private state directory ${name} is mode ${(stat.mode & 0o777).toString(8)}; run chmod 700 ${name}`);
+    }
+    for (const name of ['health.json', 'identity.json', 'recipient.json', 'enabled.json', 'expired.json', 'receive-health.json']) {
+      const file = path.join(directory, name);
+      const stat = lstatOrNull(file);
+      if (stat && stat.isFile() && !stat.isSymbolicLink() && (stat.mode & 0o777) !== 0o600) problem(`private state file ${file} is mode ${(stat.mode & 0o777).toString(8)}; run chmod 600 ${file}`);
+    }
+    const binding = readJson(path.join(directory, 'home.json'));
+    if (!binding) note('single-home binding is not written yet; the first bridge run creates it');
+    else if (binding.home !== fs.realpathSync(home)) problem(`private state belongs to another Firstmate home; point FM_DELEGATE_STATE at a state directory bound to ${fs.realpathSync(home)}`);
+    else ok('private state is bound to exactly this Firstmate home');
+    const identity = readJson(path.join(directory, 'identity.json'));
+    if (identity?.account) ok('a linked device is paired for this state');
+    else note('device is not paired yet; run pair and scan the QR');
+    const recipient = readJson(path.join(directory, 'recipient.json'));
+    if (!recipient?.account) ok('recipient defaults to Message yourself');
+    else if (canonicalJid(recipient.account) === recipient.account && recipient.account.endsWith('@s.whatsapp.net')) ok('a single second number is configured for this state');
+    else problem('recipient configuration is invalid; stop the bridge and run recipient self or recipient +COUNTRYNUMBER');
+    const lockFile = path.join(directory, 'run.lock');
+    const lock = lstatOrNull(lockFile);
+    if (!lock) ok('no live bridge holds this private state');
+    else if (!lock.isDirectory()) problem(`run.lock at ${lockFile} is not a lock directory; inspect it manually`);
+    else {
+      const owner = readJson(path.join(lockFile, 'owner.json'));
+      if (!Number.isInteger(owner?.pid) || owner.pid < 1) problem(`run.lock owner is unreadable; confirm no bridge is running, then inspect ${lockFile} manually`);
+      else {
+        let liveness = 'unknown';
+        try { processAlive(owner.pid); liveness = 'running'; }
+        catch (error) { if (error?.code === 'ESRCH') liveness = 'exited'; }
+        if (liveness === 'running') note(`a bridge process (pid ${owner.pid}) holds this state; a second instance refuses to start`);
+        else if (liveness === 'exited') problem(`stale run.lock from exited pid ${owner.pid}; confirm the process is gone, then remove ${lockFile} manually`);
+        else problem(`run.lock pid ${owner.pid} cannot be probed; inspect ${lockFile} manually before starting`);
+      }
+    }
+    const health = safeHealth(state);
+    if (health.updated_epoch == null) note('bridge health has not been written yet; run publishes it every few seconds');
+    else if (health.connected) ok('bridge health is fresh and reports connected');
+    else {
+      note(`bridge is not currently connected (${health.fresh ? 'fresh' : 'stale'} health)`);
+      if (health.fresh && health.problem) note(`health reports: ${health.problem}`);
+    }
+    const enabled = readJson(path.join(directory, 'enabled.json'));
+    if (enabled?.enabled === true) ok('WhatsApp alerts are enabled');
+    else note('WhatsApp alerts are not enabled; connect the bridge and run enable for AFK alerts');
+  } catch (error) {
+    problem(`diagnostics could not complete: ${error.message}`);
+  }
+  return finished();
+}
 export function parseArgs(argv) {
   const command = argv.shift() || 'help';
   let qrFile, recipient, messageKey, progressState, attachmentFile, value, tokenFile, userId;
@@ -76,7 +183,7 @@ export function parseArgs(argv) {
       (command === 'reply-file' && !path.isAbsolute(attachmentFile ?? '')) ||
       (command === 'summary' && !['status', 'pending', 'blocked', 'decisions', 'last result', 'more'].includes(value)) ||
       (command === 'preferences' && !value) || (command === 'telegram-config' && (!tokenFile || !userId)) ||
-      !['pair', 'run', 'status', 'notify', 'reply', 'progress', 'reply-file', 'summary', 'preferences', 'voice-status', 'telegram-config', 'enable', 'disable', 'recipient', 'ping', 'help', '--help'].includes(command)) throw new Error('invalid command; use help');
+      !['pair', 'run', 'status', 'doctor', 'notify', 'reply', 'progress', 'reply-file', 'summary', 'preferences', 'voice-status', 'telegram-config', 'enable', 'disable', 'recipient', 'ping', 'help', '--help'].includes(command)) throw new Error('invalid command; use help');
   return { command, qrFile, recipient, messageKey, progressState, attachmentFile, value, tokenFile, userId };
 }
 export function qrSvg(code) {
@@ -98,6 +205,15 @@ async function main(argv) {
   if (command === 'help' || command === '--help') { process.stdout.write(help); return; }
   const home = process.env.FM_HOME;
   if (!home || !path.isAbsolute(home)) throw new Error('set FM_HOME to an absolute operational home');
+  if (command === 'doctor') {
+    const report = doctorReport({ home, env: process.env, extensionRoot: root });
+    process.stdout.write(`fm-whatsapp installation check\nhome: ${home}\n`);
+    for (const line of report.lines) process.stdout.write(`${line}\n`);
+    process.stdout.write(report.ready
+      ? 'ready: installation can start the bridge; supervise at most one instance per private state directory under your process manager, passing the same explicit FM_HOME, FM_CODE_ROOT, FM_STATE_OVERRIDE and FM_DELEGATE_STATE environment\n'
+      : 'not ready: resolve each problem above, then run doctor again\n');
+    return report.ready ? undefined : 1;
+  }
   const state = delegateState(home);
   verifyHomeBinding(state, home);
   const firstmateState = process.env.FM_STATE_OVERRIDE || path.join(home, 'state');
@@ -409,7 +525,7 @@ async function main(argv) {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main(process.argv.slice(2)).then(() => process.exit(0)).catch(() => {
+  main(process.argv.slice(2)).then(code => process.exit(Number.isInteger(code) ? code : 0)).catch(() => {
     // Neither auth objects, QR data nor vendor errors are ever diagnostic output.
     process.stderr.write('fm-whatsapp: command failed; verify configuration, pairing and private bridge health (details omitted for privacy)\n');
     process.exit(1);

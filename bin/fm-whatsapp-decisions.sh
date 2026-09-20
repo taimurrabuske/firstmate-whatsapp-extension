@@ -6,6 +6,7 @@ set -euo pipefail
 code_root=${FM_CODE_ROOT:-$FM_HOME}
 state=${FM_STATE_OVERRIDE:-$FM_HOME/state}
 case "$FM_HOME:$code_root:$state" in /*:/*:/*) ;; *) exit 2 ;; esac
+command -v jq >/dev/null 2>&1 || { echo 'fm-whatsapp-decisions: jq is required to read recorded decisions' >&2; exit 1; }
 # Use Firstmate's installed status parser rather than copying its status schema.
 # shellcheck source=/dev/null
 . "$code_root/bin/fm-afk-contract.sh"

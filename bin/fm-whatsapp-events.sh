@@ -7,6 +7,7 @@ set -euo pipefail
 : "${FM_DELEGATE_STATE:?set FM_DELEGATE_STATE explicitly}"
 code_root=${FM_CODE_ROOT:-$FM_HOME}
 case "$FM_HOME:$FM_DELEGATE_STATE:$code_root" in /*:/*:/*) ;; *) exit 2 ;; esac
+command -v jq >/dev/null 2>&1 || { echo 'fm-whatsapp-events: jq is required to project Firstmate status events' >&2; exit 1; }
 inactive() { printf '{"schema":"fm-whatsapp-events.v1","afk":false,"session":"","events":[]}\n'; }
 enabled="$FM_DELEGATE_STATE/whatsapp/enabled.json"
 if [ ! -e "$enabled" ]; then inactive; exit 0; fi
