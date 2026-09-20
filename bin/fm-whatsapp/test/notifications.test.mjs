@@ -26,16 +26,26 @@ test('overnight quiet hours use the explicit IANA timezone', t => {
   assert.equal(policy.allow(morning[0], snapshot([event('one')]), Date.parse('2026-01-15T04:00:00Z') / 1000), false);
 });
 
-test('first observation is a baseline and later events require AFK', t => {
+test('first AFK observation baselines outcomes but immediately captures an open decision', t => {
   const { policy } = fixture(t);
-  assert.deepEqual(policy.plan(snapshot([event('historic')]), 1000), []);
-  assert.deepEqual(policy.plan(snapshot([event('historic')]), 1001), []);
-  const delivery = policy.plan(snapshot([event('historic'), event('new')]), 1002);
+  const historic = [event('done'), event('failed', 'failure'), event('working', 'progress'), event('open', 'decision')];
+  assert.deepEqual(policy.plan({ ...snapshot(historic), afk: false, session: '' }, 999), []);
+  const initial = policy.plan(snapshot(historic), 1000);
+  assert.equal(initial.length, 1); assert.deepEqual(initial[0].sourceIds, ['open']);
+  policy.commit(initial[0]);
+  assert.deepEqual(policy.plan(snapshot(historic), 1001), []);
+  const delivery = policy.plan(snapshot([...historic, event('new')]), 1002);
   assert.equal(delivery.length, 1); assert.equal(delivery[0].sourceIds[0], 'new');
   assert.equal(policy.allow(delivery[0], { ...snapshot(), afk: false, session: '' }, 1002), false);
   assert.equal(policy.allow(delivery[0], snapshot([], 'away-2'), 1002), false);
-  // A session change drops the pending old-session delivery and never revives it.
-  assert.deepEqual(policy.plan(snapshot([event('historic'), event('new')], 'away-2'), 1003), []);
+  // A session change drops pending work and baselines outcomes already present.
+  assert.deepEqual(policy.plan(snapshot([...historic, event('new')], 'away-2'), 1003), []);
+});
+
+test('an initial AFK snapshot still surfaces a current open decision', t => {
+  const { policy } = fixture(t);
+  const planned = policy.plan(snapshot([event('open-now', 'decision')]), 1);
+  assert.equal(planned.length, 1); assert.deepEqual(planned[0].sourceIds, ['open-now']);
 });
 
 test('commands are exact, durable, and subscriptions have task precedence', t => {
@@ -69,6 +79,35 @@ test('digest capture survives restart and retries until explicit commit', t => {
   assert.equal(retry[0].id, first[0].id);
   restarted.commit(first[0]);
   assert.deepEqual(new NotificationPolicy(root).plan(snapshot([event('x'), event('d', 'decision')]), 4800), []);
+});
+
+test('multipart digests preserve complete text and commit only their own page', t => {
+  const { root, policy } = fixture(t);
+  policy.command('digest 1'); policy.plan(snapshot([]), 1);
+  const sources = [1, 2, 3].map(number => ({
+    ...event(`page-${number}`), text: `${number}:${String(number).repeat(1680)}:end-${number}`
+  }));
+  assert.deepEqual(policy.plan(snapshot(sources), 2), []);
+  const pages = policy.plan(snapshot(sources), 62);
+  assert.equal(pages.length, 2);
+  assert.ok(pages.every(page => page.text.length <= 3500));
+  for (const source of sources) {
+    const owners = pages.filter(page => page.sourceIds.includes(source.id));
+    assert.equal(owners.length, 1); assert.ok(owners[0].text.includes(source.text));
+  }
+  assert.equal(pages[0].event, null);
+  policy.commit(pages[0]);
+  const afterRestart = new NotificationPolicy(root).plan(snapshot(sources), 63);
+  assert.equal(afterRestart.length, 1);
+  assert.deepEqual(afterRestart[0].sourceIds, pages[1].sourceIds);
+  assert.equal(afterRestart[0].text, pages[1].text);
+  policy.commit(afterRestart[0]);
+  assert.deepEqual(new NotificationPolicy(root).plan(snapshot(sources), 64), []);
+});
+
+test('oversize source events are rejected instead of truncated and acknowledged', t => {
+  const { policy } = fixture(t); policy.plan(snapshot([]), 1);
+  assert.throws(() => policy.plan(snapshot([{ ...event('huge'), text: 'x'.repeat(3501) }]), 2), /exceeds 3500/);
 });
 
 test('urgent decisions bypass digest but remain retryable and expire when resolved', t => {

@@ -10,8 +10,9 @@ Import `NotificationPolicy` from `bin/fm-whatsapp/notifications.mjs` and constru
 const policy = new NotificationPolicy({ stateDir: store.root });
 ```
 
-- `policy.plan(snapshot, epochSeconds)` captures unseen eligible events durably and returns zero or more deterministic delivery objects. The first snapshot establishes a baseline, avoiding historical completion floods.
-- Enqueue each returned object's `text` with its `id`, `session`, and `automatic: true`. **Only after the outbox save succeeds**, call `policy.commit(delivery)`. Until commit, restart and polling return the same deterministic delivery.
+- `policy.plan(snapshot, epochSeconds)` captures unseen eligible events durably and returns zero or more deterministic delivery objects. The first snapshot of every newly entered AFK session baselines completion, failure, and progress events, avoiding historical floods. An unseen decision that is still open is captured immediately even on that first AFK snapshot.
+- Every delivery has exactly `{id, text, kind, task, project, session, sourceIds, sourceEvents, event, automatic}`. `event` is the sole source event for a one-event delivery and `null` for a multi-event digest page; `sourceEvents` is always complete. Preserve `event`, `sourceEvents`, and `sourceIds` in the outbox for decision expiration/mapping.
+- Enqueue each returned delivery using its deterministic `id`, `text`, `session`, and metadata. **Only after that entire delivery is durably saved**, call `policy.commit(delivery)`. An atomic parent `enqueueBatch(deliveries)` followed by commits is ideal; sequential enqueue-then-commit is also safe because each digest page owns disjoint whole source events. Until commit, restart and polling return deterministic work, and committing one page leaves every later page pending.
 - `policy.allow(job, snapshot, epochSeconds)` applies AFK, quiet-hour, kind, and subscription policy immediately before send. It never grants authority and always refuses proactive delivery outside a confirmed AFK snapshot.
 - `policy.command(text)` returns `{recognized:false}` for normal chat. A recognized local shortcut returns display text and updated preferences. Do not route unrecognized text away from the normal request path.
 
@@ -29,4 +30,4 @@ Task subscription overrides project subscription; unspecified scopes default on.
 
 ## Limits
 
-Project names are the basename of the task metadata `project` path; tasks without that field have an empty project. The projection intentionally covers local active task metadata only. It does not synthesize events from panes, modify Firstmate, imply return from AFK, answer decisions, or bypass merge/spend/task gates. Digest text is bounded to WhatsApp's local message limit; an unusually large digest may be truncated, while its constituent source IDs remain explicit in the delivery object.
+Project names are the basename of the task metadata `project` path; tasks without that field have an empty project. The projection intentionally covers local active task metadata only. It does not synthesize events from panes, modify Firstmate, imply return from AFK, answer decisions, or bypass merge/spend/task gates. Digest pages are deterministically packed at whole-event boundaries and never exceed 3500 characters. A source that fits WhatsApp but cannot fit digest markup is emitted unchanged as a standalone delivery; a source over 3500 characters is rejected explicitly and is never truncated or acknowledged.

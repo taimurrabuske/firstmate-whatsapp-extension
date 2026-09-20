@@ -108,19 +108,26 @@ export class NotificationPolicy {
     const at = nowSeconds(now);
     if (!Number.isFinite(at)) throw new Error('invalid planning time');
     const preferences = this.preferences();
-    let ledger = read(this.ledgerFile, { schema: 'fm-whatsapp-notification-ledger.v1', initialized: false, seen: [], pending: {} });
+    let ledger = read(this.ledgerFile, { schema: 'fm-whatsapp-notification-ledger.v1', initialized: false, session: '', seen: [], pending: {} });
     if (ledger.schema !== 'fm-whatsapp-notification-ledger.v1' || !Array.isArray(ledger.seen) || !ledger.pending) throw new Error('invalid notification ledger');
     const events = Array.isArray(snapshot?.events) ? snapshot.events.filter(eventValid) : [];
-    if (!ledger.initialized) {
-      // Installation is an observation boundary, not a replay of the status log.
-      ledger.initialized = true;
-      ledger.seen = events.map(event => event.id).slice(-10000);
-      write(this.ledgerFile, ledger);
-      return [];
-    }
+    if (events.some(event => event.text.length > 3500)) throw new Error('notification event exceeds 3500 characters');
+    ledger.initialized = true;
     const seen = new Set(ledger.seen);
+    const enteringSession = Boolean(snapshot?.afk && snapshot.session && ledger.session !== snapshot.session);
+    if (enteringSession) {
+      // Every AFK session starts at a fresh observation boundary. Historical
+      // outcomes/progress stay silent, while an unseen decision that is still
+      // open remains actionable and is captured below.
+      for (const event of events) if (event.kind !== 'decision') seen.add(event.id);
+      ledger.session = snapshot.session;
+    }
     for (const event of events) {
       if (seen.has(event.id) || ledger.pending[event.id]) continue;
+      // An attended observation must not consume a decision that remains open
+      // when the captain later enters AFK. Outcomes are historical; an open
+      // decision is current state.
+      if (!snapshot?.afk && event.kind === 'decision') continue;
       seen.add(event.id);
       if (snapshot.afk && preferences.enabled && preferences.kinds[event.kind] && this.subscribed(event, preferences)) {
         ledger.pending[event.id] = { event, captured: at, session: snapshot.session };
@@ -143,21 +150,45 @@ export class NotificationPolicy {
     const deliveries = [];
     const immediate = ready.filter(([, pending]) => preferences.digestMinutes === 0 ||
       (pending.event.kind === 'decision' && preferences.decisionUrgent));
-    for (const [id, pending] of immediate) deliveries.push(this.delivery([id], [pending.event], pending.session, false));
+    for (const [id, pending] of immediate) deliveries.push(this.delivery([id], [pending.event], pending.session));
     const batched = ready.filter(([id]) => !immediate.some(([other]) => other === id));
     if (batched.length && Math.min(...batched.map(([, item]) => item.captured)) + preferences.digestMinutes * 60 <= at) {
-      deliveries.push(this.delivery(batched.map(([id]) => id), batched.map(([, item]) => item.event), snapshot.session, true));
+      deliveries.push(...this.digestDeliveries(batched, snapshot.session));
     }
     return deliveries;
   }
-  delivery(sourceIds, sourceEvents, session, digest) {
+  delivery(sourceIds, sourceEvents, session, text = sourceEvents[0].text, digest = false) {
+    if (text.length > 3500) throw new Error('notification delivery exceeds 3500 characters');
     const id = digest ? `notification-digest:${digestId(sourceIds)}` : `notification:${sourceIds[0]}`;
-    const text = digest
-      ? `Firstmate digest (${sourceEvents.length})\n\n${sourceEvents.map(event => `• ${event.text}`).join('\n')}`
-      : sourceEvents[0].text;
-    return { id, text: text.slice(0, 3500), kind: digest ? 'digest' : sourceEvents[0].kind,
-      task: digest ? '' : sourceEvents[0].task, project: digest ? '' : sourceEvents[0].project,
-      session, sourceIds, sourceEvents, automatic: true };
+    const event = sourceEvents.length === 1 ? sourceEvents[0] : null;
+    return { id, text, kind: digest ? 'digest' : event.kind,
+      task: digest ? '' : event.task, project: digest ? '' : event.project,
+      session, sourceIds, sourceEvents, event, automatic: true };
+  }
+  digestDeliveries(entries, session) {
+    const prefix = 'Firstmate digest\n\n';
+    const pages = [];
+    let ids = [], events = [], text = prefix;
+    const flush = () => {
+      if (!events.length) return;
+      pages.push(this.delivery(ids, events, session, text, true));
+      ids = []; events = []; text = prefix;
+    };
+    for (const [id, pending] of entries) {
+      const addition = `${events.length ? '\n' : ''}• ${pending.event.text}`;
+      if (prefix.length + 2 + pending.event.text.length > 3500) {
+        // Preserve the whole source as a standalone delivery when digest markup
+        // cannot fit around it; never truncate and then acknowledge unseen text.
+        flush();
+        pages.push(this.delivery([id], [pending.event], session));
+      } else {
+        if (text.length + addition.length > 3500) flush();
+        text += `${events.length ? '\n' : ''}• ${pending.event.text}`;
+        ids.push(id); events.push(pending.event);
+      }
+    }
+    flush();
+    return pages;
   }
   commit(delivery) {
     const ids = Array.isArray(delivery) ? delivery : delivery?.sourceIds;
