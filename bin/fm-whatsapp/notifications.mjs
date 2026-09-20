@@ -59,6 +59,21 @@ function parseTime(value) {
   return match ? Number(value.slice(0, 2)) * 60 + Number(value.slice(3)) : null;
 }
 function cloneDefaults() { return JSON.parse(JSON.stringify(DEFAULTS)); }
+function booleanRecord(value) {
+  return Boolean(value) && !Array.isArray(value) &&
+    Object.entries(value).every(([key, item]) => typeof item === 'boolean' && key);
+}
+function validPreferences(value) {
+  const quiet = value.quiet;
+  return typeof value.enabled === 'boolean' && typeof value.decisionUrgent === 'boolean' &&
+    Number.isInteger(value.digestMinutes) && value.digestMinutes >= 0 && value.digestMinutes <= 1440 &&
+    booleanRecord(value.projects) && booleanRecord(value.tasks) &&
+    Boolean(value.kinds) && KINDS.every(kind => typeof value.kinds[kind] === 'boolean') &&
+    (quiet === null || (Number.isInteger(quiet.start) && Number.isInteger(quiet.end) &&
+      quiet.start >= 0 && quiet.start <= 1439 && quiet.end >= 0 && quiet.end <= 1439 &&
+      typeof quiet.from === 'string' && typeof quiet.to === 'string' &&
+      typeof quiet.timezone === 'string' && quiet.timezone));
+}
 function eventValid(event) {
   return event && typeof event.id === 'string' && event.id && typeof event.text === 'string' && event.text &&
     KINDS.includes(event.kind) && typeof event.task === 'string' && typeof event.project === 'string';
@@ -81,6 +96,10 @@ export class NotificationPolicy {
       const fresh = { schema: 'fm-whatsapp-notifications.v1', ...cloneDefaults() };
       write(this.preferencesFile, fresh); return fresh;
     }
+    // A schema-bearing but incomplete file is damage, not defaults: refuse it
+    // with the same precise error as an unknown schema instead of failing every
+    // later plan/allow/command call with an opaque TypeError.
+    if (!validPreferences(value)) throw new Error('invalid notification preferences');
     return value;
   }
   save(preferences) { write(this.preferencesFile, preferences); }
