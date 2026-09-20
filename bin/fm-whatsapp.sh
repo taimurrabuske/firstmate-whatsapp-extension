@@ -5,8 +5,10 @@
 #        FM_HOME=/absolute/home fm-whatsapp.sh run|status|doctor|notify|ping|enable|disable|help
 # `notify` reads bounded text on stdin and queues it for the enabled delegate's current
 # Firstmate AFK session. `run` serves only the configured private chat.
-# `doctor` verifies the installation, private state and single-instance readiness
-# without connecting. The Node CLI owns the exact lifecycle, private state and
+# `doctor` verifies the installation, private state, single-instance ownership,
+# queues, uncertain handoffs, adapter liveness and service-manager binding
+# without connecting and without changing anything. The Node CLI owns the exact
+# lifecycle, private state and
 # command contracts; `help` prints them. No command invokes a model or grants
 # approval authority. Install pinned dependencies with: npm ci --prefix bin/fm-whatsapp
 set -euo pipefail

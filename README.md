@@ -206,6 +206,11 @@ The runtime can be supervised by an existing process manager using the same expl
 Do not launch a second copy against the same state directory.
 After an unclean shutdown, inspect the reported `run.lock` and confirm its recorded process is gone before removing that lock directory.
 
+`./bin/fm-whatsapp.sh doctor` is a read-only diagnostic for operators and process managers.
+It classifies bridge health and recovery posture without connecting: connected versus disconnected transports, live versus stale single-instance lock ownership (including lock age and a lock recorded for another Firstmate home or private state directory, which usually means the service manager exports a mismatched `FM_HOME` or `FM_DELEGATE_STATE`), queued, pending, and uncertain request counts, handoff receipts left uncertain or mid-publication by an interrupted bridge, inbox wake adapter configuration and controller watcher beacon liveness, and fresh connected health that no live lock owns.
+Each finding names the exact safe next action, such as aligning the service-manager environment or comparing a handoff receipt with Firstmate's pending and handled inbox.
+Diagnostics never remove a lock, retry an uncertain handoff, restart a service, or mutate queues, and they never print credentials, phone numbers, or message bodies; recovery stays manual and bounded by inspection.
+
 Inbound messages are accepted only from the selected private chat.
 Other contacts, groups, forwarded content, history, and unsupported media are ignored. Text is handed to the controller as a request, never evaluated as shell code by the bridge.
 Accepted requests are journaled before handing off to Firstmate.

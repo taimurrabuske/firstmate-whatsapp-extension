@@ -11,13 +11,14 @@ import { stageAttachment, outboundContent, attachmentBytes } from './media.mjs';
 import { loadVoiceConfig, transcribeVoice, validateVoicePaths, VOICE_CONFIG_SCHEMA } from './voice.mjs';
 import { MediaIntake } from './media-intake.mjs';
 import { TelegramDelegate, telegramStore, telegramConfig, telegramConfigured, configureTelegram } from './telegram.mjs';
-import { Acknowledgements, Bridge, Store, readJson, writeJson, delegateState, verifyHomeBinding, ownIdentity, canonicalJid, authenticatedMessage, validText, parseRequest, epoch, MAX_TEXT, validateSnapshot } from './core.mjs';
+import { Acknowledgements, Bridge, Store, readJson, writeJson, delegateState, verifyHomeBinding, ownIdentity, canonicalJid, authenticatedMessage, validText, parseRequest, epoch, MAX_TEXT, MAX_QUEUE, validateSnapshot } from './core.mjs';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const help = `Usage: FM_HOME=/absolute/home bin/fm-whatsapp.sh <command>
   pair [--qr-file /absolute/file]  Display a QR (SVG when file ends .svg), exit after linking.
   run                            Run the self-chat bridge until stopped with SIGINT/SIGTERM.
-  status                         Print private bridge health without connecting.
-  doctor                         Verify installation, dependencies, private state, and single-instance readiness.
+  status                         Print private bridge health and single-instance lock ownership without connecting.
+  doctor                         Verify installation, dependencies, private state, single-instance ownership, queues,
+                                 uncertain handoffs, adapter liveness, and service-manager binding. Read-only.
   reply <message-key>            Queue stdin response to an accepted phone request, including outside AFK.
   progress <key> <state>         Report picked-up, working, waiting, or failed; detail on stdin.
   reply-file <key> <file>        Send a local image/report for this request; optional caption on stdin.
@@ -55,14 +56,37 @@ export function connectionDisposition(code, reasons) {
 }
 export function reconnectDelay(attempt) { return Math.min(60000, 1000 * 2 ** Math.min(attempt, 6)); }
 export function safeHealth(state, now = epoch()) {
-  const data = readJson(path.join(state, 'whatsapp/health.json'));
+  let data = null;
+  try { data = readJson(path.join(state, 'whatsapp/health.json')); } catch { data = null; }
   const fresh = Number.isFinite(data?.updated_epoch) && data.updated_epoch <= now + 5 && data.updated_epoch >= now - 60;
   return { connected: data?.connected === true && fresh, fresh: Boolean(fresh),
     updated_epoch: data?.updated_epoch ?? null, queued: data?.queued ?? 0,
     pending: data?.pending ?? 0, uncertain: data?.uncertain ?? 0,
+    lock: lockOwner(state).state,
     problem: fresh ? (data.problem || '') : 'bridge is not running or health is stale' };
 }
 function lstatOrNull(file) { try { return fs.lstatSync(file); } catch { return null; } }
+function realpathOrNull(file) { try { return fs.realpathSync(file); } catch { return null; } }
+// Read-only single-instance ownership classification for run.lock. Never
+// removes a lock; 'exited' means the recorded pid is gone (stale), 'live'
+// means the recorded process still exists. Locks recorded before owner
+// metadata was introduced report null home/delegateState/started.
+export function lockOwner(state, processAlive = pid => { process.kill(pid, 0); }) {
+  const file = path.join(state, 'whatsapp', 'run.lock');
+  const stat = lstatOrNull(file);
+  if (!stat) return { state: 'absent', file };
+  if (!stat.isDirectory()) return { state: 'invalid', file };
+  let owner = null;
+  try { owner = readJson(path.join(file, 'owner.json')); } catch { owner = null; }
+  if (!Number.isInteger(owner?.pid) || owner.pid < 1) return { state: 'unreadable', file };
+  let liveness = 'unknown';
+  try { processAlive(owner.pid); liveness = 'live'; }
+  catch (error) { if (error?.code === 'ESRCH') liveness = 'exited'; }
+  return { state: liveness, file, pid: owner.pid,
+    started: Number.isInteger(owner?.started) ? owner.started : null,
+    home: typeof owner?.home === 'string' ? owner.home : null,
+    delegateState: typeof owner?.delegateState === 'string' ? owner.delegateState : null };
+}
 function resolveTransport(extensionRoot) {
   const requireModule = createRequire(path.join(extensionRoot, 'bin/fm-whatsapp', 'package.json'));
   for (const name of ['@whiskeysockets/baileys', 'qrcode-terminal']) {
@@ -79,7 +103,7 @@ function jqInstalled() {
 export function doctorReport({ home, env = process.env, extensionRoot = root,
   nodeMajor = Number(process.versions.node.split('.')[0]),
   transportReady = resolveTransport(root), jqReady = jqInstalled(),
-  processAlive = pid => { process.kill(pid, 0); } } = {}) {
+  processAlive = pid => { process.kill(pid, 0); }, now = epoch() } = {}) {
   const lines = [];
   const missing = [];
   const ok = detail => lines.push(`ok: ${detail}`);
@@ -124,9 +148,10 @@ export function doctorReport({ home, env = process.env, extensionRoot = root,
       const stat = lstatOrNull(file);
       if (stat && stat.isFile() && !stat.isSymbolicLink() && (stat.mode & 0o777) !== 0o600) problem(`private state file ${file} is mode ${(stat.mode & 0o777).toString(8)}; run chmod 600 ${file}`);
     }
+    const canonicalHome = fs.realpathSync(home);
     const binding = readJson(path.join(directory, 'home.json'));
     if (!binding) note('single-home binding is not written yet; the first bridge run creates it');
-    else if (binding.home !== fs.realpathSync(home)) problem(`private state belongs to another Firstmate home; point FM_DELEGATE_STATE at a state directory bound to ${fs.realpathSync(home)}`);
+    else if (binding.home !== canonicalHome) problem(`private state belongs to another Firstmate home; point FM_DELEGATE_STATE at a state directory bound to ${canonicalHome}`);
     else ok('private state is bound to exactly this Firstmate home');
     const identity = readJson(path.join(directory, 'identity.json'));
     if (identity?.account) ok('a linked device is paired for this state');
@@ -139,28 +164,90 @@ export function doctorReport({ home, env = process.env, extensionRoot = root,
     if (!lstatOrNull(voiceFile)) note('offline voice transcription is not configured; voice-config set enables local whisper.cpp (optional, never downloads a model)');
     else if (loadVoiceConfig({ file: () => voiceFile }).available) ok('offline voice transcription configuration validates');
     else problem('voice.json is not a valid private transcription configuration; run voice-config inspect, then voice-config set to rewrite it');
-    const lockFile = path.join(directory, 'run.lock');
-    const lock = lstatOrNull(lockFile);
-    if (!lock) ok('no live bridge holds this private state');
-    else if (!lock.isDirectory()) problem(`run.lock at ${lockFile} is not a lock directory; inspect it manually`);
+    // Single-instance ownership: live versus stale, with recorded binding.
+    const lock = lockOwner(state, processAlive);
+    if (lock.state === 'absent') ok('no live bridge holds this private state');
+    else if (lock.state === 'invalid') problem(`run.lock at ${lock.file} is not a lock directory; inspect it manually`);
+    else if (lock.state === 'unreadable') problem(`run.lock owner is unreadable; confirm no bridge is running, then inspect ${lock.file} manually`);
+    else if (lock.state === 'unknown') problem(`run.lock pid ${lock.pid} cannot be probed; inspect ${lock.file} manually before starting`);
     else {
-      const owner = readJson(path.join(lockFile, 'owner.json'));
-      if (!Number.isInteger(owner?.pid) || owner.pid < 1) problem(`run.lock owner is unreadable; confirm no bridge is running, then inspect ${lockFile} manually`);
-      else {
-        let liveness = 'unknown';
-        try { processAlive(owner.pid); liveness = 'running'; }
-        catch (error) { if (error?.code === 'ESRCH') liveness = 'exited'; }
-        if (liveness === 'running') note(`a bridge process (pid ${owner.pid}) holds this state; a second instance refuses to start`);
-        else if (liveness === 'exited') problem(`stale run.lock from exited pid ${owner.pid}; confirm the process is gone, then remove ${lockFile} manually`);
-        else problem(`run.lock pid ${owner.pid} cannot be probed; inspect ${lockFile} manually before starting`);
-      }
+      const age = lock.started == null ? null : Math.max(0, now - lock.started);
+      if (lock.state === 'live') note(`a bridge process (pid ${lock.pid}) holds this state; a second instance refuses to start`);
+      else problem(`stale run.lock from exited pid ${lock.pid}${age == null ? '' : ` (lock age ${age}s)`}; confirm the process is gone, then remove ${lock.file} manually`);
+      // A lock recorded for another home or private state directory means the
+      // service manager is starting the bridge with a mismatched environment.
+      // Diagnostics only name the alignment action; they never remove a lock.
+      if (lock.home != null && lock.home !== canonicalHome)
+        problem(`run.lock was recorded for another Firstmate home (${lock.home}); align FM_HOME in the service manager environment before starting here`);
+      if (lock.delegateState != null && lock.delegateState !== directory &&
+          realpathOrNull(lock.delegateState) !== realpathOrNull(directory))
+        problem(`run.lock was recorded for another private state directory (${lock.delegateState}); align FM_DELEGATE_STATE in the service manager environment`);
     }
-    const health = safeHealth(state);
+    const health = safeHealth(state, now);
     if (health.updated_epoch == null) note('bridge health has not been written yet; run publishes it every few seconds');
     else if (health.connected) ok('bridge health is fresh and reports connected');
     else {
       note(`bridge is not currently connected (${health.fresh ? 'fresh' : 'stale'} health)`);
       if (health.fresh && health.problem) note(`health reports: ${health.problem}`);
+    }
+    if (health.connected && health.fresh && lock.state !== 'live')
+      problem('health is fresh and reports connected but no live run.lock owner exists; a second instance would start unchecked; find the publisher before starting');
+    if (lock.state === 'live' && !health.fresh)
+      note(`a bridge holds run.lock but health is ${health.updated_epoch == null ? 'not written yet' : 'stale'}; it may still be starting or reconnecting`);
+    if (!health.connected && lock.state === 'absent' && identity?.account)
+      note('bridge is not running; start it once under your process manager with the same explicit FM_HOME, FM_CODE_ROOT, FM_STATE_OVERRIDE and FM_DELEGATE_STATE environment');
+    // Bounded queue inventory: counts and phases only, never message text.
+    const inventory = (name, limit = 200) => {
+      try {
+        const files = fs.readdirSync(path.join(directory, name)).filter(entry => /^[a-f0-9]{64}\.json$/.test(entry));
+        return { files: files.slice(0, limit), total: files.length };
+      } catch { return null; }
+    };
+    const safeRecord = file => { try { return readJson(file); } catch { return null; } };
+    const outbox = inventory('outbox', MAX_QUEUE);
+    if (outbox) {
+      if (outbox.total >= MAX_QUEUE) problem(`outbound queue is full (${outbox.total} messages); the bridge refuses new alerts until delivery drains; do not delete queued files manually`);
+      else if (outbox.total > 0) note(`outbound queue holds ${outbox.total} message(s); delivery resumes automatically when the bridge connects`);
+    }
+    const pendingQueue = inventory('pending');
+    if (pendingQueue?.total) {
+      const unproved = pendingQueue.files.filter(name => safeRecord(path.join(directory, 'pending', name))?.uncertain === true);
+      if (unproved.length) problem(`${unproved.length} accepted request(s) could not be proved delivered to Firstmate; inspect their handoff receipts and Firstmate's pending and handled inbox; never delete a receipt or republish automatically`);
+      else note(`${pendingQueue.total} accepted request(s) await processing; the bridge retries them automatically`);
+    }
+    const handoffs = inventory('handoffs');
+    if (handoffs?.total) {
+      const phaseCount = phase => handoffs.files.filter(name => safeRecord(path.join(directory, 'handoffs', name))?.phase === phase).length;
+      const uncertain = phaseCount('uncertain'), calling = phaseCount('calling');
+      if (uncertain) problem(`${uncertain} handoff receipt(s) record an uncertain publication in ${path.join(directory, 'handoffs')}; compare them with Firstmate's pending and handled inbox; never delete a receipt or retry the handoff automatically`);
+      if (calling) problem(`${calling} handoff receipt(s) were left mid-publication by an interrupted bridge; recheck after the bridge restarts; do not delete them`);
+      if (handoffs.total > handoffs.files.length) note(`handoff receipt scan covered the first ${handoffs.files.length} of ${handoffs.total} receipts`);
+    }
+    // Inbox wake adapter availability and controller watcher liveness (read-only).
+    const adapterConfigFile = env.WHATSAPP_ADAPTER_CONFIG || path.join(state, 'inbox-adapter.json');
+    if (!lstatOrNull(adapterConfigFile)) note('inbox wake adapter is not configured; requests are saved but may not wake the controller; see README "Connect the controlling Firstmate"');
+    else {
+      let adapterConfig = null;
+      try { adapterConfig = readJson(adapterConfigFile); } catch { adapterConfig = null; }
+      if (!adapterConfig || adapterConfig.schema !== 'firstmate.whatsapp-inbox-config.v1')
+        problem(`inbox adapter configuration ${adapterConfigFile} is unreadable or has an unrecognized schema; re-register the whatsapp-inbox source; do not edit captured results`);
+      else {
+        const bound = { whatsapp_state: realpathOrNull(directory), fm_home: canonicalHome };
+        const mismatched = Object.keys(bound).filter(key => adapterConfig[key] !== bound[key]);
+        const stage = typeof adapterConfig.extension_root === 'string' ?
+          path.join(adapterConfig.extension_root, 'adapter/bin/firstmate-extension.mjs') : null;
+        if (mismatched.length || !stage || !lstatOrNull(stage))
+          problem(`inbox adapter configuration ${adapterConfigFile} does not match this installation${mismatched.length ? ` (${mismatched.join(', ')})` : ''}; re-register the whatsapp-inbox source; do not edit captured results`);
+        else ok('inbox adapter configuration matches this home and private state');
+      }
+    }
+    const beaconFile = path.join(env.FM_STATE_OVERRIDE || path.join(home, 'state'), '.last-watcher-beat');
+    const beacon = lstatOrNull(beaconFile);
+    if (!beacon || !beacon.isFile() || beacon.isSymbolicLink()) note('no controller watcher beacon found; wake liveness is unproven');
+    else {
+      const age = Math.max(0, now - Math.floor(beacon.mtimeMs / 1000));
+      if (age >= 300) note(`controller watcher beacon is ${age}s old; saved requests may not be picked up; check the controller watcher before relying on wakes`);
+      else ok(`controller watcher beacon is fresh (${age}s old)`);
     }
     const enabled = readJson(path.join(directory, 'enabled.json'));
     if (enabled?.enabled === true) ok('WhatsApp alerts are enabled');

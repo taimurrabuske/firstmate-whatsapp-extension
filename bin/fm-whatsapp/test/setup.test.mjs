@@ -28,7 +28,8 @@ function fixture(t) {
     extensionRoot: root,
     // Dependency probes depend on the local machine, not the scenario under
     // test; lock liveness stays real so stale and live locks are exercised.
-    transportReady: true, jqReady: true, ...(overrides.probes ?? {}) });
+    transportReady: true, jqReady: true, ...(overrides.probes ?? {}),
+    ...(overrides.now != null ? { now: overrides.now } : {}) });
   return { base, home, codeRoot, state, env, report };
 }
 
@@ -39,8 +40,14 @@ function paired(t) {
   writeJson(store.file('recipient.json'), { account: peerAccount });
   writeJson(store.file('health.json'), { connected: true, updated_epoch: epoch(), account: peerAccount, problem: '', queued: 0, pending: 0, uncertain: 0 });
   writeJson(store.file('enabled.json'), { enabled: true });
+  // A healthy paired state has a live owner: doctor treats fresh connected
+  // health without a live lock as a single-instance contradiction.
+  fs.mkdirSync(store.file('run.lock'), { mode: 0o700 });
+  writeJson(store.file('run.lock/owner.json'), { pid: process.pid, token: 'fixture', started: epoch(),
+    home: fs.realpathSync(fx.home), delegateState: store.root });
   return { fx, store };
 }
+const hexKey = value => value.toString(16).padStart(64, '0');
 
 test('fresh unpaired installation reports ready with setup notes only', t => {
   const { report } = fixture(t);
@@ -68,6 +75,7 @@ test('stale lock from an exited pid is a problem naming the manual removal path'
   const { fx, store } = paired(t);
   const exited = spawnSync(process.execPath, ['-e', '']);
   assert.equal(exited.status, 0);
+  fs.rmSync(store.file('run.lock'), { recursive: true });
   fs.mkdirSync(store.file('run.lock'), { mode: 0o700 });
   writeJson(store.file('run.lock/owner.json'), { pid: exited.pid, token: 'gone' });
   const result = fx.report();
@@ -78,18 +86,59 @@ test('stale lock from an exited pid is a problem naming the manual removal path'
   assert.match(line, /remove/);
 });
 
-test('live lock reports single-instance ownership as a note, never a failure', t => {
+test('stale lock age from recorded ownership bounds how long the state was held', t => {
   const { fx, store } = paired(t);
-  fs.mkdirSync(store.file('run.lock'), { mode: 0o700 });
-  writeJson(store.file('run.lock/owner.json'), { pid: process.pid, token: 'self' });
+  const exited = spawnSync(process.execPath, ['-e', '']);
+  assert.equal(exited.status, 0);
+  writeJson(store.file('run.lock/owner.json'), { pid: exited.pid, token: 'gone', started: epoch() - 120 });
+  const line = fx.report().lines.find(line => line.includes('stale run.lock'));
+  assert.match(line, /lock age 12[01]s/);
+  assert.ok(line.includes(store.file('run.lock')));
+});
+
+test('live lock reports single-instance ownership as a note, never a failure', t => {
+  const { fx } = paired(t);
   const result = fx.report();
   assert.equal(result.ready, true);
   assert.ok(result.lines.some(line => /holds this state/.test(line) && line.includes(String(process.pid))));
   assert.ok(result.lines.every(line => !line.startsWith('problem:')));
 });
 
+test('a lock recorded for another home or state directory is a service-manager binding mismatch', t => {
+  const { fx, store } = paired(t);
+  writeJson(store.file('run.lock/owner.json'), { pid: process.pid, token: 'x', started: epoch(),
+    home: path.join(fx.base, 'other-home'), delegateState: path.join(fx.base, 'elsewhere') });
+  const result = fx.report();
+  assert.equal(result.ready, false);
+  const text = result.lines.join('\n');
+  assert.match(text, /recorded for another Firstmate home/);
+  assert.match(text, /another private state directory/);
+  assert.match(text, /never remove|align FM_HOME/);
+});
+
+test('fresh connected health without a live lock is a single-instance contradiction', t => {
+  const { fx, store } = paired(t);
+  fs.rmSync(store.file('run.lock'), { recursive: true });
+  const result = fx.report();
+  assert.equal(result.ready, false);
+  assert.match(result.lines.join('\n'), /no live run\.lock owner exists/);
+});
+
+test('a live lock with stale health stays a note, and a stopped bridge gets exact start guidance', t => {
+  const { fx, store } = paired(t);
+  writeJson(store.file('health.json'), { connected: false, updated_epoch: epoch() - 999, account: identity.account, problem: '', queued: 0, pending: 0, uncertain: 0 });
+  let result = fx.report();
+  assert.equal(result.ready, true);
+  assert.match(result.lines.join('\n'), /may still be starting or reconnecting/);
+  fs.rmSync(store.file('run.lock'), { recursive: true });
+  result = fx.report();
+  assert.equal(result.ready, true);
+  assert.match(result.lines.join('\n'), /start it once under your process manager/);
+});
+
 test('unreadable lock owner and non-directory lock require manual inspection', t => {
   const { fx, store } = paired(t);
+  fs.rmSync(store.file('run.lock'), { recursive: true });
   fs.mkdirSync(store.file('run.lock'), { mode: 0o700 });
   let result = fx.report();
   assert.equal(result.ready, false);
@@ -99,6 +148,78 @@ test('unreadable lock owner and non-directory lock require manual inspection', t
   result = fx.report();
   assert.equal(result.ready, false);
   assert.match(result.lines.join('\n'), /not a lock directory/);
+});
+
+test('queue backlogs and uncertain handoffs are counted without exposing message content', t => {
+  const { fx, store } = paired(t);
+  writeJson(store.file(`outbox/${hexKey(1)}.json`), { text: 'PRIVATE BODY' });
+  writeJson(store.file(`outbox/${hexKey(2)}.json`), {});
+  writeJson(store.file(`pending/${hexKey(3)}.json`), { uncertain: true });
+  fs.mkdirSync(store.file('handoffs'), { mode: 0o700 });
+  writeJson(store.file(`handoffs/${hexKey(3)}.json`), { phase: 'uncertain' });
+  let result = fx.report();
+  assert.equal(result.ready, false);
+  const text = result.lines.join('\n');
+  assert.match(text, /outbound queue holds 2 message\(s\)/);
+  assert.match(text, /1 accepted request\(s\) could not be proved delivered/);
+  assert.match(text, /never delete a receipt or republish automatically/);
+  assert.match(text, /1 handoff receipt\(s\) record an uncertain publication/);
+  assert.ok(!text.includes('PRIVATE BODY'));
+  // A mid-publication receipt left by an interrupted bridge is its own finding.
+  writeJson(store.file(`handoffs/${hexKey(4)}.json`), { phase: 'calling' });
+  assert.match(fx.report().lines.join('\n'), /left mid-publication by an interrupted bridge/);
+  // A clean pending job is only a note: the bridge retries it automatically.
+  fs.rmSync(store.file(`pending/${hexKey(3)}.json`));
+  fs.rmSync(store.file(`handoffs/${hexKey(3)}.json`));
+  fs.rmSync(store.file(`handoffs/${hexKey(4)}.json`));
+  writeJson(store.file(`pending/${hexKey(5)}.json`), { uncertain: false });
+  result = fx.report();
+  assert.equal(result.ready, true);
+  assert.match(result.lines.join('\n'), /1 accepted request\(s\) await processing/);
+});
+
+test('a full outbound queue is a problem that still forbids manual deletion', t => {
+  const { fx, store } = paired(t);
+  for (let i = 0; i < 100; i++) writeJson(store.file(`outbox/${hexKey(i + 16)}.json`), {});
+  const result = fx.report();
+  assert.equal(result.ready, false);
+  assert.match(result.lines.join('\n'), /outbound queue is full \(100 messages\)/);
+  assert.match(result.lines.join('\n'), /do not delete queued files manually/);
+});
+
+test('inbox adapter configuration and watcher beacon liveness are reported read-only', t => {
+  const { fx, store } = paired(t);
+  let text = fx.report().lines.join('\n');
+  assert.match(text, /inbox wake adapter is not configured/);
+  const configFile = path.join(fx.state, 'inbox-adapter.json');
+  fs.writeFileSync(configFile, JSON.stringify({ schema: 'firstmate.whatsapp-inbox-config.v1',
+    whatsapp_state: path.join(fx.base, 'elsewhere'), fm_home: fs.realpathSync(fx.home), extension_root: root }), { mode: 0o600 });
+  text = fx.report().lines.join('\n');
+  assert.match(text, /does not match this installation/);
+  assert.match(text, /whatsapp_state/);
+  fs.writeFileSync(configFile, JSON.stringify({ schema: 'firstmate.whatsapp-inbox-config.v1',
+    whatsapp_state: store.root, fm_home: fs.realpathSync(fx.home), fm_state: path.join(fx.base, 'fmstate'),
+    extension_root: root, poll_ms: 30000 }), { mode: 0o600 });
+  let result = fx.report();
+  assert.equal(result.ready, true);
+  assert.match(result.lines.join('\n'), /inbox adapter configuration matches this home and private state/);
+  assert.match(result.lines.join('\n'), /no controller watcher beacon found/);
+  // Beacon freshness is evaluated against the injected clock; stale stays a note.
+  const fmState = path.join(fx.base, 'fmstate'); fs.mkdirSync(fmState, { recursive: true });
+  fs.writeFileSync(path.join(fmState, '.last-watcher-beat'), '');
+  const beacon = overrides => fx.report({ env: { FM_STATE_OVERRIDE: fmState }, ...overrides });
+  let beaconResult = beacon({ now: epoch() + 10 });
+  assert.equal(beaconResult.ready, true);
+  assert.match(beaconResult.lines.join('\n'), /beacon is fresh \(1\ds old\)/);
+  beaconResult = beacon({ now: epoch() + 400 });
+  assert.equal(beaconResult.ready, true);
+  assert.match(beaconResult.lines.join('\n'), /beacon is 40\ds old/);
+  // An operator-selected configuration path is honored.
+  const selected = path.join(fx.base, 'selected-config.json');
+  fs.writeFileSync(selected, 'not json', { mode: 0o600 });
+  result = fx.report({ env: { WHATSAPP_ADAPTER_CONFIG: selected } });
+  assert.equal(result.ready, false);
+  assert.match(result.lines.join('\n'), /unreadable or has an unrecognized schema/);
 });
 
 test('binding mismatch and home-path errors preserve the single-home contract', t => {
@@ -185,7 +306,6 @@ test('relative delegate state cannot pass diagnostics', t => {
 
 test('doctor CLI exits nonzero on problems and never prints phone numbers', t => {
   const { fx, store } = paired(t);
-  fs.mkdirSync(store.file('run.lock'), { mode: 0o700 });
   writeJson(store.file('run.lock/owner.json'), { pid: 2147483000, token: 'x' });
   const result = spawnSync(process.execPath, [cli, 'doctor'], { encoding: 'utf8', env: { ...process.env, ...fx.env } });
   assert.equal(result.status, 1);
@@ -236,7 +356,7 @@ test('wrapper refuses an incomplete checkout and passes a complete one through t
   result = spawnSync('/bin/bash', [wrapper, 'status'], { encoding: 'utf8', env: { ...process.env, ...fx.env } });
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), { connected: false, fresh: false, updated_epoch: null,
-    queued: 0, pending: 0, uncertain: 0, problem: 'bridge is not running or health is stale' });
+    queued: 0, pending: 0, uncertain: 0, lock: 'absent', problem: 'bridge is not running or health is stale' });
 });
 
 test('projection scripts name jq clearly when it is absent', t => {

@@ -133,6 +133,7 @@ export class Store {
     this.root = path.join(state, 'whatsapp');
     privateDirectory(this.root);
     const canonicalHome = fs.realpathSync(home);
+    this.home = canonicalHome;
     const bindingFile = this.file('home.json');
     if (!readJson(bindingFile)) {
       const staged = this.file(`.home-${crypto.randomUUID()}.tmp`);
@@ -226,8 +227,10 @@ export class Store {
       catch (probe) { if (probe.code !== 'ESRCH') throw probe; }
       throw new Error('stale bridge lock; inspect and remove run.lock before restarting');
     }
+    // Owner metadata lets read-only diagnostics distinguish live from stale
+    // ownership and detect a service manager bound to another home or state.
     const token = crypto.randomUUID();
-    writeJson(path.join(lock, 'owner.json'), { pid: process.pid, token });
+    writeJson(path.join(lock, 'owner.json'), { pid: process.pid, token, started: epoch(), home: this.home, delegateState: this.root });
     return () => {
       const current = readJson(path.join(lock, 'owner.json'));
       if (current?.token === token) fs.rmSync(lock, { recursive: true });

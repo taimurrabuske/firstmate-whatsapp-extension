@@ -318,6 +318,14 @@ test('status CLI is read-only, redacts account and credentials, and rejects impl
   assert.equal(result.status, 1);
   assert.equal(safeHealth(f.state, 1000).connected, true);
   assert.equal(safeHealth(f.state, 1061).connected, false);
+  assert.equal(safeHealth(f.state, 1000).lock, 'absent');
+  fs.mkdirSync(f.store.file('run.lock'), { mode: 0o700 });
+  const exited = spawnSync(process.execPath, ['-e', '']);
+  assert.equal(exited.status, 0);
+  writeJson(f.store.file('run.lock/owner.json'), { pid: exited.pid, token: 'gone', started: 900 });
+  assert.equal(safeHealth(f.state, 1000).lock, 'exited');
+  writeJson(f.store.file('run.lock/owner.json'), { pid: process.pid, token: 'self', started: 900 });
+  assert.equal(safeHealth(f.state, 1000).lock, 'live');
 });
 
 test('server acknowledgement must match own account/id; local send alone is insufficient', async () => {
