@@ -61,7 +61,8 @@ function atomicCopyFromFd(store, fd, { bucket, kind, mime, name, maximum }) {
       offset += read; size += read;
       if (size > maximum) throw new Error('attachment exceeds size limit');
       if (headLength < head.length) { const count = Math.min(read, head.length - headLength); chunk.copy(head, headLength, 0, count); headLength += count; }
-      hash.update(chunk.subarray(0, read)); fs.writeSync(out, chunk, 0, read);
+      hash.update(chunk.subarray(0, read));
+      if (fs.writeSync(out, chunk, 0, read) !== read) throw new Error('attachment staging write interrupted');
     }
     fs.fsyncSync(out);
   } catch (error) { fs.closeSync(out); fs.rmSync(temp, { force: true }); throw error; }
@@ -143,6 +144,8 @@ export function attachmentBytes(job, store) {
   } finally { fs.closeSync(opened.fd); }
 }
 
+const MAX_INBOUND_TRANSCRIPT = 12_000;
+
 function number(value) {
   try { const result = Number(typeof value === 'object' && value !== null ? value.toString() : value); return Number.isSafeInteger(result) ? result : NaN; }
   catch { return NaN; }
@@ -188,7 +191,7 @@ async function writeDownload(store, source, metadata) {
     for await (const value of iterable) {
       const chunk = Buffer.from(value); size += chunk.length;
       if (size > metadata.size || size > MEDIA_LIMITS[metadata.kind]) throw new Error('download exceeded declared media size');
-      fs.writeSync(fd, chunk);
+      if (fs.writeSync(fd, chunk, 0, chunk.length) !== chunk.length) throw new Error('media download write interrupted');
     }
     fs.fsyncSync(fd);
   } catch (error) { fs.closeSync(fd); fs.rmSync(temp, { force: true }); throw error; }
@@ -209,13 +212,14 @@ export async function authenticatedMediaMessage(message, identity, now, pairedAt
   if (metadata.kind === 'voice') {
     const result = typeof transcribe === 'function' ? await transcribe(attachment.path, metadata) :
       { available: false, message: 'Voice transcription is unavailable; configure private offline whisper.cpp and ffmpeg paths.' };
-    if (result?.available) {
+    if (result?.available && typeof result.text === 'string' && result.text.trim() &&
+        result.text.length <= MAX_INBOUND_TRANSCRIPT) {
       const transcript = store.file(`attachments/incoming/${attachment.digest}.transcript.txt`);
       fs.writeFileSync(transcript, result.text, { mode: 0o600 });
       detail = `\nAuthenticated instruction (local whisper.cpp transcript of this voice note; the paired phone's spoken note text, delivered without any caption):\n` +
         `Full private transcript (read completely): ${transcript}\n` +
         `Bounded transcript preview (start):\n${result.text.slice(0, 2200)}\nBounded transcript preview (end).`;
-    } else detail = `\n${result?.message || 'Voice transcription unavailable.'}`;
+    } else detail = `\n${result?.message || 'Voice transcription returned no usable text.'}`;
   }
   const label = metadata.kind === 'voice' ? 'voice note' : metadata.kind;
   return { ...metadata, attachment, text: `WhatsApp ${label} received (remote; away mode unchanged).\nLocal attachment: ${attachment.path}\nMIME: ${attachment.mime}; bytes: ${attachment.size}.${detail}`.slice(0, MAX_TEXT) };

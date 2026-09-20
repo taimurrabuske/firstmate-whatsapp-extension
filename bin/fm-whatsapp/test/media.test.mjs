@@ -97,6 +97,28 @@ test('declared and streamed incoming limits are both enforced', async t => {
   assert.equal(fs.readdirSync(store.file('attachments/incoming')).filter(n => n.startsWith('.download')).length, 0);
 });
 
+test('interrupted or unusable download streams are refused and leave no private residue', async t => {
+  const { store } = fixture(t);
+  const short = media({ mimetype: 'image/png', fileLength: png.length + 50 });
+  await assert.rejects(authenticatedMediaMessage(short, identity, 1010, 1000, null,
+    { store, download: async function* () { yield png; } }), /did not match authenticated metadata/);
+  const unusable = media({ mimetype: 'image/png', fileLength: png.length });
+  await assert.rejects(authenticatedMediaMessage(unusable, identity, 1010, 1000, null,
+    { store, download: async () => 42 }), /byte stream/);
+  assert.deepEqual(fs.readdirSync(store.file('attachments/incoming')), []);
+});
+
+test('unusable injected transcript text fails closed without writing a transcript file', async t => {
+  const { store } = fixture(t), bytes = Buffer.from('OggSvoice');
+  for (const text of ['x'.repeat(12001), '', null]) {
+    const result = await authenticatedMediaMessage(media({ mimetype: 'audio/ogg', fileLength: bytes.length,
+      seconds: 10, ptt: true }, {}, 'audioMessage'), identity, 1010, 1000, null,
+      { store, download: async () => bytes, transcribe: async () => ({ available: true, text }) });
+    assert.match(result.text, /usable text/);
+    assert.equal(fs.existsSync(`${result.attachment.path}.transcript.txt`), false);
+  }
+});
+
 test('second-number inbound route and voice metadata preserve fromMe policy', () => {
   const peer = { account: '15555550999@s.whatsapp.net', aliases: ['15555550999@s.whatsapp.net', '999@lid'] };
   const voice = { mimetype: 'audio/ogg; codecs=opus', fileLength: 20, seconds: 8, ptt: true };
