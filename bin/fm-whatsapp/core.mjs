@@ -205,6 +205,21 @@ export class Store {
       if (record.at < now - 86400) fs.unlinkSync(this.file(`incoming/${file}`));
     }
   }
+  // Delivery receipts age out on the same day boundary as inbound receipts so
+  // the sent journal cannot grow without bound or dead-end delivery at its
+  // size limit. Duplicate suppression and quoted-reply context stay provable
+  // for that window; records without a confident delivery time, and anything
+  // unreadable, are retained for inspection instead of being assumed old.
+  pruneSent(now, maxAge = 86400) {
+    for (const file of this.records('sent')) {
+      let record;
+      try { record = readJson(this.file(`sent/${file}`)); }
+      catch { continue; }
+      const delivered = record.delivered ?? record.created;
+      if (!Number.isFinite(delivered) || delivered > now - maxAge) continue;
+      fs.unlinkSync(this.file(`sent/${file}`));
+    }
+  }
   enqueue(text, { kind = 'alert', session, id = crypto.randomUUID(), automatic = false, route, requestKey, event,
     sourceEvents, attachment, fallbackRoute, part = null, now = epoch() } = {}) {
     if (!validText(text) || !['alert', 'reply'].includes(kind) || typeof session !== 'string') throw new Error('invalid outbound message');
@@ -341,6 +356,7 @@ export class Bridge {
       this.problem = 'event source unavailable; alerts remain queued';
     }
     this.store.pruneIncoming(this.clock());
+    this.store.pruneSent(this.clock());
     this.health();
   }
   stage(batch) {

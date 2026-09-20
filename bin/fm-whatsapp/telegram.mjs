@@ -212,10 +212,15 @@ export class TelegramDelegate {
            (job.route && !sameRoute(job.route, this.store.currentRoute())))) continue;
         if (job.kind === 'alert' && (!snapshot.afk || job.session !== snapshot.session || !this.notificationAllowed(job, snapshot, this.clock()))) continue;
         if (readJson(this.store.file(`sent/${name}`))) { fs.unlinkSync(file); continue; }
-        const attachment = job.attachment ? await this.attachmentReader?.(job) : undefined;
-        if (job.attachment && !attachment) throw new Error('attachment unavailable');
         let remoteId;
-        try { remoteId = await client.send(`${PREFIX}${job.text}`, attachment); }
+        try {
+          // An unavailable staged attachment is an ordinary retryable send
+          // failure: persist the backoff like any failed send instead of
+          // aborting the whole tick and hot-looping without progress.
+          const attachment = job.attachment ? await this.attachmentReader?.(job) : undefined;
+          if (job.attachment && !attachment) throw new Error('attachment unavailable');
+          remoteId = await client.send(`${PREFIX}${job.text}`, attachment);
+        }
         catch {
           job.attempts = (job.attempts ?? 0) + 1; job.next = this.clock() + Math.min(300, 2 ** Math.min(job.attempts, 8));
           writeJson(file, job); break;

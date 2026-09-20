@@ -191,7 +191,7 @@ Start a private conversation with your bot from that user. Only that exact user/
 
 After a two-minute WhatsApp outage, newly queued responses with an explicitly bound Telegram fallback may be delivered there. Older unbound messages are held on their original route. Pairing or token changes cannot redirect old replies to a new recipient. Telegram continues running when WhatsApp requires re-pairing, provided the bridge already has an authenticated WhatsApp identity.
 Outbound delivery on both transports follows enqueue order (durable sequence, never filesystem hash order), so multi-part results and digest pages arrive in order across restarts and retries.
-That keep-alive decision reads only the durable local Telegram configuration, so a transiently unreadable token file cannot stop a configured fallback; failed deliveries are reported and retried instead. Proactive fallback alerts retain all AFK and preference gates. Telegram's server receipt does not prove human readership; a crash after a send but before its local receipt can duplicate a message. No paid messaging feature is used. Telegram is **not activated** by installing the addon.
+That keep-alive decision reads only the durable local Telegram configuration, so a transiently unreadable token file cannot stop a configured fallback; failed deliveries are reported and retried instead. Proactive fallback alerts retain all AFK and preference gates. An unavailable report attachment backs off and retries like a failed send instead of stalling the fallback tick. Telegram's server receipt does not prove human readership; a crash after a send but before its local receipt can duplicate a message. No paid messaging feature is used. Telegram is **not activated** by installing the addon.
 
 ## Private state and lifecycle
 
@@ -221,7 +221,10 @@ If the inbox helper was interrupted and publication cannot be proved, the reques
 Its private `whatsapp/handoffs/` receipt preserves the exact envelope and publication phase.
 Check both Firstmate's pending and handled inbox and ensure the old helper has exited before attempting recovery; do not delete the receipt and blindly retry a potentially delivered instruction.
 Notifications wait for a matching server acknowledgement; this does not prove that a person read them.
-A remote-send/local-receipt crash can duplicate an outbound message.
+Outbound delivery is journaled: a durable receipt is written before the queued entry is removed, so a restart after a crash between those steps recovers without a second send.
+Sends the server accepted but whose local receipt was lost can still duplicate on retry: delivery is at-least-once, never exactly-once.
+Delivery receipts are retained for 24 hours like inbound receipts; within that window duplicate suppression and quoted-reply context are provable, and unsent queued messages never expire on their own except proactive alerts whose session ended or whose decision is no longer open.
+See [the outbound delivery journal](docs/delivery.md).
 Offline queues retry, and questions from ended AFK sessions or resolved decisions expire.
 
 ## Validation

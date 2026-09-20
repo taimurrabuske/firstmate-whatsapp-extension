@@ -16,6 +16,10 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 Transport sizing and ordering primitives live in `bin/fm-whatsapp/core.mjs`: `chunkText`/`truncateText`/`safeBoundaryEnd` are the only sanctioned way to cut text at a size boundary (never split surrogate pairs or CRLF, lossless by construction), and outbox delivery order is the durable `seq` stamped under the queue lock, read via `outboundOrder` — never outbox filename (hash) order. Multi-part replies share a `part.family`; a waiting part holds later parts in both `Bridge.flush` and the Telegram fallback. `requests.mjs` imports from `core.mjs` while `core.mjs` imports `RequestJournal`, so module-load-time use of core constants in `requests.mjs` must stay lazy (TDZ).
 
+## Outbound delivery journal invariants
+
+Crash-window and retry tests live in `bin/fm-whatsapp/test/outbound-delivery.test.mjs`; the journal contract they enforce is documented in `docs/delivery.md`. Sharp edges: crash windows are reproduced by restoring the exact durable files a crash leaves (outbox entry, sent receipt) and running a fresh `Bridge`/`TelegramDelegate`, not by hooking writes; `enqueue` regenerates a random `remoteId` when it creates an entry, so restoring the captured job object is the only way to preserve retry identity across a simulated crash; the Telegram fallback outage gate measures from the last tick that observed WhatsApp connected, so a fallback-path test must tick `connected: true` once before advancing the clock.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
