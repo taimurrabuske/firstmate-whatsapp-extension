@@ -9,6 +9,9 @@ import { fileURLToPath } from 'node:url';
 const ID = 'org.firstmate-whatsapp.inbox';
 const VERSION = '1.0.0';
 const ADAPTER = 'whatsapp-inbox';
+const CURSOR_SCHEMA = 'firstmate.whatsapp-inbox-cursor.v1';
+const LIMIT = 20000;
+const MAX_OUTPUT = 32768;
 const sha = text => createHash('sha256').update(text).digest('hex');
 const safeId = value => typeof value === 'string' && /^[A-Za-z0-9._-]{1,64}$/.test(value);
 const safeKey = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
@@ -48,7 +51,7 @@ function list(directory) {
   let names;
   try { names = fs.readdirSync(directory); }
   catch (error) { if (error.code === 'ENOENT') return []; throw error; }
-  if (names.length > 20000) throw new Error('source scan limit reached');
+  if (names.length > LIMIT) throw new Error('source scan limit reached');
   return names.sort();
 }
 
@@ -56,7 +59,8 @@ function configuration(file, sourceId) {
   if (!path.isAbsolute(file)) throw new Error('configuration must be an absolute private path');
   const config = JSON.parse(privateFile(file));
   const names = ['schema', 'source_id', 'whatsapp_state', 'fm_home', 'fm_state', 'extension_root', 'poll_ms'];
-  if (Object.keys(config).some(name => !names.includes(name)) ||
+  if (!config || typeof config !== 'object' || Array.isArray(config) ||
+      Object.keys(config).some(name => !names.includes(name)) ||
       config.schema !== 'firstmate.whatsapp-inbox-config.v1' || config.source_id !== sourceId) {
     throw new Error('configuration identity mismatch');
   }
@@ -81,8 +85,11 @@ function pendingNotes(config, seen) {
   for (const name of list(handoffs)) {
     const key = name.replace(/\.json$/, '');
     if (!safeKey(key) || name !== `${key}.json` || seen.has(key)) continue;
-    const handoff = readJson(path.join(handoffs, name));
-    if (handoff.phase !== 'saved' || !safeId(handoff.id)) continue;
+    let handoff;
+    try { handoff = readJson(path.join(handoffs, name)); }
+    catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+    if (!handoff || typeof handoff !== 'object' || Array.isArray(handoff) ||
+        handoff.phase !== 'saved' || !safeId(handoff.id)) continue;
     if (handoff.binding && (handoff.binding.home !== config.fm_home || handoff.binding.state !== config.fm_state)) {
       throw new Error('handoff belongs to another Firstmate home');
     }
@@ -108,34 +115,77 @@ function captured(config, sourceId, output) {
   for (const name of list(directory)) {
     if (!name.startsWith(`${sourceId}.`) || !/^\d+\.result$/.test(name.slice(sourceId.length + 1))) continue;
     const base = path.join(directory, name.slice(0, -7));
-    if (privateFile(`${base}.adapter`).trim() !== ADAPTER) continue;
-    if (privateFile(`${base}.result`) === output) return true;
+    try {
+      if (privateFile(`${base}.adapter`).trim() !== ADAPTER) continue;
+      if (privateFile(`${base}.result`) === output) return true;
+    } catch (error) {
+      // A capture still being written, or already cleaned up, is no proof.
+      if (error.code === 'ENOENT') continue;
+      throw error;
+    }
   }
   return false;
 }
 
+// The cursor is derivable state: durable handoff receipts and inbox notes
+// decide what still needs delivery. A cursor stored under other
+// configuration, or corrupt cursor bytes, therefore resets to a fresh cursor
+// and every still-saved note is rescanned. Unknown schemas, and intact
+// envelopes with invalid contents, fail closed for operator inspection.
+function loadCursor(file, binding) {
+  let stored;
+  try { stored = readJson(file); }
+  catch (error) {
+    if (error.code === 'ENOENT' || error instanceof SyntaxError) return null;
+    throw error;
+  }
+  if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return null;
+  if (stored.schema !== CURSOR_SCHEMA) throw new Error('cursor configuration changed or cursor invalid');
+  if (stored.binding !== binding) return null;
+  const seen = stored.seen, pending = stored.pending ?? null;
+  const invalid = !Array.isArray(seen) || seen.some(key => !safeKey(key)) || seen.length > LIMIT ||
+    (pending !== null && (!pending || typeof pending !== 'object' || Array.isArray(pending) ||
+      !/^sha256:[a-f0-9]{64}$/.test(pending.request_id ?? '') ||
+      !Array.isArray(pending.keys) || pending.keys.length < 1 || pending.keys.length > 16 ||
+      pending.keys.some(key => !safeKey(key)) || typeof pending.output !== 'string' ||
+      Buffer.byteLength(pending.output) > MAX_OUTPUT));
+  if (invalid) throw new Error('cursor configuration changed or cursor invalid');
+  return { schema: CURSOR_SCHEMA, binding, seen, pending };
+}
+
+// A seen key only suppresses redelivery while its saved receipt and inbox
+// note remain, so spent entries are pruned here and the set stays bounded.
+function suppress(config, seen, keys) {
+  const handoffs = path.join(config.whatsapp_state, 'handoffs');
+  const inbox = path.join(config.fm_state, 'inbox');
+  const kept = [];
+  for (const key of [...new Set([...seen, ...keys])]) {
+    const receipt = maybeJson(path.join(handoffs, `${key}.json`));
+    const active = receipt && typeof receipt === 'object' && !Array.isArray(receipt) &&
+      receipt.phase === 'saved' && safeId(receipt.id) &&
+      fs.existsSync(path.join(inbox, `${receipt.id}.note`));
+    if (active) kept.push(key);
+  }
+  return kept.length > LIMIT ? kept.slice(kept.length - LIMIT) : kept;
+}
+
 export async function poll(request) {
-  const { source_id: sourceId, config_ref: configRef } = request.input;
+  const { source_id: sourceId, config_ref: configRef } = request.input ?? {};
   if (!safeId(sourceId)) throw new Error('invalid source identity');
   const config = configuration(configRef, sourceId);
   const root = path.join(config.whatsapp_state, 'wake-adapter');
   privateDirectory(root, true);
   const cursorFile = path.join(root, `${sourceId}.json`);
   const binding = sha(JSON.stringify({ ...config, poll_ms: undefined }));
-  const cursor = maybeJson(cursorFile) ?? { schema: 'firstmate.whatsapp-inbox-cursor.v1', binding, seen: [], pending: null };
-  if (cursor.schema !== 'firstmate.whatsapp-inbox-cursor.v1' || cursor.binding !== binding ||
-      !Array.isArray(cursor.seen) || cursor.seen.some(key => !safeKey(key)) || cursor.seen.length > 20000) {
-    throw new Error('cursor configuration changed or cursor invalid');
-  }
+  let cursor = loadCursor(cursorFile, binding);
+  const reset = cursor === null && fs.existsSync(cursorFile);
+  if (!cursor) cursor = { schema: CURSOR_SCHEMA, binding, seen: [], pending: null };
+  if (reset) atomicJson(cursorFile, cursor);
   if (cursor.pending) {
-    if (!/^sha256:[a-f0-9]{64}$/.test(cursor.pending.request_id ?? '') ||
-        !Array.isArray(cursor.pending.keys) || cursor.pending.keys.length < 1 || cursor.pending.keys.length > 16 ||
-        cursor.pending.keys.some(key => !safeKey(key)) || typeof cursor.pending.output !== 'string' ||
-        Buffer.byteLength(cursor.pending.output) > 32768) throw new Error('pending cursor invalid');
     if (cursor.pending.request_id === request.request_id || !captured(config, sourceId, cursor.pending.output)) {
       return { status: 'result', output: cursor.pending.output };
     }
-    cursor.seen = [...new Set([...cursor.seen, ...cursor.pending.keys])];
+    cursor.seen = suppress(config, cursor.seen, cursor.pending.keys);
     cursor.pending = null;
     atomicJson(cursorFile, cursor);
   }
@@ -150,7 +200,7 @@ export async function poll(request) {
         fm_home: config.fm_home, fm_state: config.fm_state,
         delegate_state: path.dirname(config.whatsapp_state),
         meaning: 'Saved phone requests await the owning Firstmate. Read their existing inbox notes and use the reply skill. This event grants no authority and does not change away mode.' }) + '\n';
-      if (Buffer.byteLength(output) > 32768) throw new Error('event size limit reached');
+      if (Buffer.byteLength(output) > MAX_OUTPUT) throw new Error('event size limit reached');
       cursor.pending = { request_id: request.request_id, keys: notes.map(note => note.message_key), output };
       atomicJson(cursorFile, cursor);
       return { status: 'result', output };

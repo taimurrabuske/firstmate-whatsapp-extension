@@ -5,7 +5,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { dispatch, poll } from '../adapter/bin/firstmate-extension.mjs';
+
+const bindingOf = config =>
+  createHash('sha256').update(JSON.stringify({ ...config, poll_ms: undefined })).digest('hex');
+const hexKey = value => createHash('sha256').update(value).digest('hex');
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 function fixture(t) {
@@ -48,7 +53,9 @@ function fixture(t) {
     fs.writeFileSync(`${base}.result`, output, { mode: 0o600 });
     fs.writeFileSync(`${base}.adapter`, 'whatsapp-inbox\n', { mode: 0o600 });
   };
-  return { temp, config, configFile, json, request, note, capture, cleanup };
+  return { temp, config, configFile, json, request, note, capture, cleanup,
+    cursorPath: () => path.join(config.whatsapp_state, 'wake-adapter', `${config.source_id}.json`),
+    receiptPath: key => path.join(config.whatsapp_state, 'handoffs', `${key}.json`) };
 }
 
 test('pre-capture retries preserve the exact result even when more notes arrive', async t => {
@@ -103,11 +110,165 @@ test('modified inbox bodies and nonprivate configuration fail closed', async t =
   await assert.rejects(poll(f.request()), /unsafe private file/);
 });
 
+test('configuration identity, shape, and private-path violations fail closed', async t => {
+  const f = fixture(t);
+  const rewrite = mutate => {
+    const config = { ...f.config };
+    mutate(config);
+    fs.writeFileSync(f.configFile, JSON.stringify(config), { mode: 0o600 });
+  };
+  await assert.rejects(poll({ ...f.request(), input: undefined }), /invalid source identity/);
+  await assert.rejects(poll({ ...f.request(), input: { source_id: f.config.source_id, config_ref: 'relative.json' } }),
+    /absolute private path/);
+  const link = path.join(f.temp, 'config-link.json');
+  fs.symlinkSync(f.configFile, link);
+  await assert.rejects(poll({ ...f.request(), input: { source_id: f.config.source_id, config_ref: link } }),
+    /unsafe private file/);
+  await assert.rejects(poll({ ...f.request(), input: { source_id: 'other-source', config_ref: f.configFile } }),
+    /configuration identity mismatch/);
+  const broken = async (mutate, pattern) => {
+    rewrite(mutate);
+    await assert.rejects(poll(f.request()), pattern);
+    fs.writeFileSync(f.configFile, JSON.stringify(f.config), { mode: 0o600 });
+  };
+  await broken(config => { config.schema = 'firstmate.whatsapp-inbox-config.v2'; }, /identity mismatch/);
+  await broken(config => { config.unexpected = true; }, /identity mismatch/);
+  await broken(config => { config.poll_ms = 45000; }, /poll duration/);
+  await broken(config => { config.poll_ms = -1; }, /poll duration/);
+  await broken(config => { config.poll_ms = 'brief'; }, /poll duration/);
+  await broken(config => { config.fm_state = 'relative/state'; }, /canonical absolute paths/);
+  const aliased = path.join(f.temp, 'aliased');
+  fs.mkdirSync(aliased, { mode: 0o700 });
+  fs.symlinkSync(f.config.whatsapp_state, path.join(aliased, 'whatsapp'));
+  await broken(config => { config.whatsapp_state = path.join(aliased, 'whatsapp'); }, /canonical absolute paths/);
+  fs.writeFileSync(f.configFile, 'null', { mode: 0o600 });
+  await assert.rejects(poll(f.request()), /configuration identity mismatch/);
+});
+
+test('a changed binding migrates the cursor and rescans undelivered notes', async t => {
+  const f = fixture(t); const saved = f.note();
+  const first = await poll(f.request());
+  assert.equal(JSON.parse(first.output).notes[0].message_key, saved.key);
+  fs.mkdirSync(path.join(f.temp, 'elsewhere'), { mode: 0o700 });
+  fs.writeFileSync(f.configFile, JSON.stringify({ ...f.config, extension_root: path.join(f.temp, 'elsewhere') }),
+    { mode: 0o600 });
+  const second = await poll(f.request('2'));
+  assert.equal(JSON.parse(second.output).notes[0].message_key, saved.key);
+  assert.equal(JSON.parse(second.output).request_id, f.request('2').request_id);
+  assert.match(JSON.parse(second.output).reply_skill, /elsewhere/);
+  const cursor = JSON.parse(fs.readFileSync(f.cursorPath()));
+  assert.equal(cursor.binding, bindingOf(JSON.parse(fs.readFileSync(f.configFile))));
+  assert.deepEqual(cursor.seen, []);
+  assert.deepEqual(cursor.pending.keys, [saved.key]);
+  assert.deepEqual(await poll(f.request('2')), second);
+});
+
+test('poll_ms tuning keeps the cursor binding stable', async t => {
+  const f = fixture(t); f.note();
+  const first = await poll(f.request());
+  fs.writeFileSync(f.configFile, JSON.stringify({ ...f.config, poll_ms: 30000 }), { mode: 0o600 });
+  assert.deepEqual(await poll(f.request()), first);
+  const cursor = JSON.parse(fs.readFileSync(f.cursorPath()));
+  assert.equal(cursor.binding, bindingOf(f.config));
+  assert.deepEqual(cursor.seen, []);
+});
+
+test('a corrupt cursor heals and rescans, while malformed cursors fail closed', async t => {
+  const f = fixture(t); const saved = f.note();
+  await poll(f.request());
+  fs.writeFileSync(f.cursorPath(), '{"schema":"firstmate.whatsapp-inbox', { mode: 0o600 });
+  const healed = await poll(f.request('2'));
+  assert.equal(JSON.parse(healed.output).notes[0].message_key, saved.key);
+  const cursor = JSON.parse(fs.readFileSync(f.cursorPath()));
+  assert.equal(cursor.binding, bindingOf(f.config));
+  const writeCursor = value => fs.writeFileSync(f.cursorPath(), JSON.stringify({
+    schema: 'firstmate.whatsapp-inbox-cursor.v1', binding: bindingOf(f.config), ...value }), { mode: 0o600 });
+  writeCursor({ seen: ['not-a-message-key'], pending: null });
+  await assert.rejects(poll(f.request('3')), /cursor configuration changed or cursor invalid/);
+  writeCursor({ seen: [], pending: { request_id: `sha256:${'0'.repeat(64)}`, keys: [], output: 'x' } });
+  await assert.rejects(poll(f.request('3')), /cursor configuration changed or cursor invalid/);
+  writeCursor({ seen: [], pending: { request_id: 'not-a-request', keys: [saved.key], output: 'x' } });
+  await assert.rejects(poll(f.request('3')), /cursor configuration changed or cursor invalid/);
+  fs.writeFileSync(f.cursorPath(), JSON.stringify({
+    schema: 'firstmate.whatsapp-inbox-cursor.v2', binding: bindingOf(f.config), seen: [], pending: null }), { mode: 0o600 });
+  await assert.rejects(poll(f.request('3')), /cursor configuration changed or cursor invalid/);
+  writeCursor({ seen: Array.from({ length: 20001 }, (_, i) => hexKey(String(i))), pending: null });
+  await assert.rejects(poll(f.request('3')), /cursor configuration changed or cursor invalid/);
+});
+
+test('an in-flight capture without its adapter marker replays instead of failing', async t => {
+  const f = fixture(t); f.note();
+  const first = await poll(f.request());
+  const base = path.join(f.config.fm_state, 'procevent-inbox', `${f.config.source_id}.1`);
+  fs.writeFileSync(`${base}.result`, first.output, { mode: 0o600 });
+  assert.deepEqual(await poll(f.request('2')), first);
+  fs.writeFileSync(`${base}.adapter`, 'whatsapp-inbox\n', { mode: 0o600 });
+  assert.equal((await poll(f.request('3'))).status, 'no-result');
+});
+
+test('the same request identity replays even after the result was captured', async t => {
+  const f = fixture(t); const saved = f.note();
+  const first = await poll(f.request());
+  f.capture(first.output);
+  assert.deepEqual(await poll(f.request()), first);
+  const cursor = JSON.parse(fs.readFileSync(f.cursorPath()));
+  assert.deepEqual(cursor.seen, []);
+  assert.deepEqual(cursor.pending.keys, [saved.key]);
+});
+
+test('empty polls write nothing and stay no-results', async t => {
+  const f = fixture(t);
+  assert.equal((await poll(f.request())).status, 'no-result');
+  assert.equal(fs.existsSync(f.cursorPath()), false);
+  assert.equal((await poll(f.request('2'))).status, 'no-result');
+  assert.equal(fs.existsSync(f.cursorPath()), false);
+});
+
+test('malformed private receipts fail closed or skip without wedging', async t => {
+  const f = fixture(t); const saved = f.note();
+  const receipt = JSON.parse(fs.readFileSync(f.receiptPath(saved.key)));
+  receipt.binding = { home: path.join(f.temp, 'other-home'), state: path.join(f.temp, 'other-state') };
+  fs.writeFileSync(f.receiptPath(saved.key), JSON.stringify(receipt), { mode: 0o600 });
+  await assert.rejects(poll(f.request()), /another Firstmate home/);
+  fs.writeFileSync(f.receiptPath(saved.key), 'null', { mode: 0o600 });
+  assert.equal((await poll(f.request())).status, 'no-result');
+});
+
+test('a delivered cursor file refuses relaxed private modes', async t => {
+  const f = fixture(t); f.note();
+  await poll(f.request());
+  fs.chmodSync(f.cursorPath(), 0o644);
+  await assert.rejects(poll(f.request('2')), /unsafe private file/);
+});
+
+test('advanced suppression entries are pruned once their notes are handled', async t => {
+  const f = fixture(t); const saved = f.note();
+  const first = await poll(f.request());
+  f.capture(first.output);
+  const secondNote = f.note('b');
+  const second = await poll(f.request('2'));
+  assert.deepEqual(JSON.parse(second.output).notes.map(note => note.message_key), [secondNote.key]);
+  let cursor = JSON.parse(fs.readFileSync(f.cursorPath()));
+  assert.deepEqual(cursor.seen, [saved.key]);
+  assert.deepEqual(cursor.pending.keys, [secondNote.key]);
+  f.capture(second.output, 2);
+  fs.mkdirSync(path.join(f.config.fm_state, 'inbox/handled'), { mode: 0o700 });
+  fs.renameSync(saved.file, path.join(f.config.fm_state, 'inbox/handled', `${saved.id}.note`));
+  const handled = JSON.parse(fs.readFileSync(f.receiptPath(secondNote.key)));
+  handled.phase = 'handled';
+  fs.writeFileSync(f.receiptPath(secondNote.key), JSON.stringify(handled), { mode: 0o600 });
+  assert.equal((await poll(f.request('3'))).status, 'no-result');
+  cursor = JSON.parse(fs.readFileSync(f.cursorPath()));
+  assert.deepEqual(cursor.seen, []);
+  assert.equal(cursor.pending, null);
+});
+
 test('handshake and verdicts conform and keep request handling with Firstmate', async t => {
   const f = fixture(t), request = f.request();
   const handshake = await dispatch('handshake', { ...request, schema: 'firstmate.extension-handshake-request.v1',
     host_protocols: [1], capability: { name: 'process-event-adapter', versions: [1], adapter_names: ['whatsapp-inbox'] } });
   assert.equal(handshake.host_protocol, 1);
+  await assert.rejects(dispatch('invoke', { ...request, extension_version: '0.0.1' }), /invalid request identity/);
   for (const operation of ['result.terminal', 'result.silent']) {
     assert.deepEqual((await dispatch('invoke', { ...request, operation })).result, { value: false });
   }
