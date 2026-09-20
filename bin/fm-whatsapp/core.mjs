@@ -66,6 +66,13 @@ export function validText(text) {
   return typeof text === 'string' && text.trim().length > 0 && text.length <= MAX_TEXT &&
     !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text);
 }
+export function parseRequest(text) {
+  if (!validText(text)) return null;
+  const shortcut = /^(?:!fm\s+)?(status|help)$/i.exec(text.trim());
+  if (shortcut) return { operation: shortcut[1].toLowerCase() };
+  const legacyNote = /^!fm\s+note\s+([\s\S]+)$/i.exec(text);
+  return { operation: 'note', text: legacyNote ? legacyNote[1] : text };
+}
 export function authenticatedMessage(message, identity, now, pairedAt, peer = null) {
   const key = message?.key;
   if (!identity || key?.fromMe !== !peer || typeof key.id !== 'string' ||
@@ -258,17 +265,14 @@ export class Bridge {
       if (!incoming || this.store.incoming(incoming.key) || this.store.sentByRemoteId(incoming.id)) continue;
       const file = this.store.file(`pending/${incoming.key}.json`);
       if (readJson(file)) continue;
-      const command = /^!fm\s+(status|help|note)(?:\s+([\s\S]*))?$/i.exec(incoming.text);
-      let operation, body = '';
-      if (['status', 'help'].includes(command?.[1].toLowerCase()) && !command[2]) {
-        operation = command[1].toLowerCase();
-      } else {
+      const request = parseRequest(incoming.text);
+      if (!request) continue;
+      const operation = request.operation;
+      let body = '';
+      if (operation === 'note') {
         const quoted = this.store.sentByRemoteId(incoming.quotedId);
-        const text = command?.[1].toLowerCase() === 'note' ? command[2] : (!command && quoted ? incoming.text : null);
-        if (!validText(text)) continue;
         const context = quoted ? `\nReply to Firstmate: ${quoted.text}\n` : '\n';
-        operation = 'note';
-        body = `WhatsApp phone note (remote; remain away).${context}\n${text}`;
+        body = `WhatsApp phone note (remote; remain away).${context}\n${request.text}`;
       }
       if (this.store.records('pending').length >= MAX_QUEUE) {
         this.problem = 'incoming queue full; new messages require retry'; this.health(); break;
@@ -295,7 +299,7 @@ export class Bridge {
         let response;
         if (job.operation === 'status') response = (await this.status()).slice(0, MAX_TEXT);
         else if (job.operation === 'help') {
-          response = 'Use !fm status for recorded fleet status, !fm note TEXT to leave a note, or reply to a Firstmate message. Phone notes do not end away mode. Decisions still need explicit supervisor handling.';
+          response = 'Send your instruction directly—no prefix needed. Send status for recorded fleet status or help for this guide. Reply to a Firstmate message to include its context. Phone messages do not end away mode. Decisions still need explicit supervisor handling.';
         } else if (job.operation === 'note') {
           await this.inbox(job.key, job.body);
           response = 'Your note is saved for Firstmate. Away mode is unchanged; this receipt does not mean any action was approved or completed.';

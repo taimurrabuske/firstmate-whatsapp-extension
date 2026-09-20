@@ -48,7 +48,7 @@ test('configured second number accepts its incoming PN/LID chat and rejects self
   const f = fixture(t);
   const peer = { account: '15555550999@s.whatsapp.net', aliases: ['15555550999@s.whatsapp.net', '9988@lid'] };
   f.bridge.peer = peer;
-  const incoming = (key = {}, extra = {}) => message('!fm note hello', { id: 'REMOTE', remoteJid: peer.account, fromMe: false, ...key }, extra);
+  const incoming = (key = {}, extra = {}) => message('hello', { id: 'REMOTE', remoteJid: peer.account, fromMe: false, ...key }, extra);
   for (const key of [{ fromMe: true }, { remoteJid: identity.account }, { remoteJid: '777@s.whatsapp.net' },
     { remoteJid: '9988@g.us' }, { remoteJidAlt: '777@s.whatsapp.net' }, { participant: identity.account }]) {
     assert.equal(authenticatedMessage(incoming(key), identity, 1010, 1000, peer), null);
@@ -116,7 +116,23 @@ test('status is read-only and text notes use hashed account/message identity wit
   assert.ok(f.calls.inbox[0].text.endsWith(text));
   assert.match(f.calls.inbox[0].text, /remain away/);
   await f.bridge.receive(batch(message('normal text', { id: 'NORMAL' }), message('!fm exec rm', { id: 'EXEC' })));
+  assert.equal(f.calls.inbox.length, 3);
+  assert.ok(f.calls.inbox.some(note => note.text.endsWith('normal text')));
+  assert.ok(f.calls.inbox.some(note => note.text.endsWith('!fm exec rm')));
+});
+
+test('plain status and help are shortcuts; other unprefixed text is preserved as a request', async t => {
+  const f = fixture(t);
+  await f.bridge.receive(batch(message('  STATUS\n', { id: 'PLAIN_STATUS' }), message('help', { id: 'PLAIN_HELP' })));
+  assert.equal(f.calls.status, 1);
+  assert.equal(f.calls.inbox.length, 0);
+  const instruction = 'status of the failing simulation, please\nKeep the existing circuit.';
+  await f.bridge.receive(batch(message(instruction, { id: 'PLAIN_NOTE' })));
+  await f.bridge.receive(batch(message(instruction, { id: 'PLAIN_NOTE' })));
   assert.equal(f.calls.inbox.length, 1);
+  assert.ok(f.calls.inbox[0].text.endsWith(instruction));
+  const replies = f.store.records('outbox').map(name => readJson(f.store.file(`outbox/${name}`)).text);
+  assert.ok(replies.some(text => text.includes('no prefix needed')));
 });
 
 test('self-chat phone traffic survives fromMe filtering while outbound echoes are suppressed', async t => {
@@ -168,7 +184,9 @@ test('contextual reply uses persisted sent context, ignores attacker-supplied qu
   assert.ok(!f.calls.inbox[0].text.includes('all future'));
   await f.bridge.receive(batch(message('unused', { id: 'UNKNOWN' }, { message: { extendedTextMessage: {
     text: 'yes', contextInfo: { stanzaId: 'unknown' } } } })));
-  assert.equal(f.calls.inbox.length, 1);
+  assert.equal(f.calls.inbox.length, 2);
+  assert.ok(f.calls.inbox[1].text.endsWith('yes'));
+  assert.ok(!f.calls.inbox[1].text.includes('Reply to Firstmate:'));
 });
 
 test('events notify once per session; offline queue persists and retries with same remote identity', async t => {

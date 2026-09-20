@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { FirstmateAdapter } from './firstmate.mjs';
-import { Acknowledgements, Bridge, Store, readJson, writeJson, delegateState, verifyHomeBinding, ownIdentity, canonicalJid, authenticatedMessage, validText, epoch, MAX_TEXT, validateSnapshot } from './core.mjs';
+import { Acknowledgements, Bridge, Store, readJson, writeJson, delegateState, verifyHomeBinding, ownIdentity, canonicalJid, authenticatedMessage, validText, parseRequest, epoch, MAX_TEXT, validateSnapshot } from './core.mjs';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const help = `Usage: FM_HOME=/absolute/home bin/fm-whatsapp.sh <command>
   pair [--qr-file /absolute/file]  Display a QR (SVG when file ends .svg), exit after linking.
@@ -22,7 +22,7 @@ FM_STATE_OVERRIDE selects Firstmate state only, never bridge credentials.
 Bridge records use FM_DELEGATE_STATE or XDG_STATE_HOME/firstmate-whatsapp/<home-hash>/whatsapp.
 Without XDG_STATE_HOME, ~/.local/state is used. State is bound to canonical FM_HOME.
 Only the configured recipient's private conversation is accepted; default is Message Yourself.
-Commands: !fm status, !fm help, !fm note TEXT; replies to sent Firstmate messages become notes.
+Send instructions directly, without a prefix. Shortcuts: status, help. Legacy !fm commands still work.
 Stop never logs the device out. Unlink it in WhatsApp's Linked devices when retiring it.
 Pending sends remain queued on failure; remote acceptance does not prove a human read.
 A remote-send/local-receipt crash can duplicate a notification, never create approval authority.
@@ -93,7 +93,7 @@ async function main(argv) {
   }
   if (command === 'ping') {
     if (!safeHealth(state).connected) throw new Error('bridge must be connected');
-    store.enqueue('Firstmate is connected to this number. Reply with !fm status to check the connection, or !fm note followed by your instruction.', { kind: 'reply', session: '' });
+    store.enqueue('Firstmate is connected to this number. Send status to check the connection, or send your instruction directly. No prefix is needed.', { kind: 'reply', session: '' });
     process.stdout.write('connection test queued\n'); return;
   }
   if (command === 'enable' || command === 'disable') {
@@ -222,7 +222,7 @@ async function main(argv) {
               absent: message.key?.[field] == null, empty: message.key?.[field] === '',
               matches: identity?.aliases.includes(canonicalJid(message.key?.[field])) })),
             textValid: validText(message.message?.conversation ?? message.message?.extendedTextMessage?.text),
-            recognizedCommand: /^!fm\s+(status|help|note)(?:\s|$)/i.test(message.message?.conversation ?? message.message?.extendedTextMessage?.text ?? ''),
+            requestType: parseRequest(message.message?.conversation ?? message.message?.extendedTextMessage?.text)?.operation ?? null,
             authenticated: Boolean(authenticatedMessage(message, bridge.identity, epoch(), bridge.pairedAt, bridge.peer)),
             stubType: message.messageStubType ?? null
           }));

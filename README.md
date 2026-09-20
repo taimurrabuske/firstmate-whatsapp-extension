@@ -58,10 +58,14 @@ Firstmate retains hold-for-return behavior whenever a response is unavailable.
 
 In the configured chat (Message yourself by default, or the chat with the linked account from your second number):
 
-- `!fm status` reads recorded fleet status without waking Firstmate.
-- `!fm note Please check the failing simulation` saves a request and wakes the existing supervisor.
-- `!fm help` shows the command summary.
+- `status` reads recorded fleet status without waking Firstmate.
+- `Please check the failing simulation` saves a request and wakes the existing supervisor.
+- `help` shows the command summary.
 - Reply to a delivered Firstmate question to include its persisted context with your answer.
+
+No prefix is required: ordinary text goes directly to Firstmate as a request.
+Only the exact words `status` and `help` are local shortcuts, ignoring case and surrounding whitespace.
+The older `!fm status`, `!fm help`, and `!fm note TEXT` forms remain accepted.
 
 The supervisor must be running and handling its inbox to answer conversational requests.
 Each note includes the path to this extension's [supervisor skill](skills/whatsapp-delegate/SKILL.md) and a reply command.

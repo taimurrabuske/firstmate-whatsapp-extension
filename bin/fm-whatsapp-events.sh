@@ -31,7 +31,7 @@ rows=$(
     while IFS=$'\t' read -r key verb note || [ -n "$key" ]; do
       [ "$verb" = needs-decision ] || continue
       jq -cn --arg id "$task:$key" --arg task "$task" --arg key "$key" --arg text "$note" \
-        '{id:$id,text:("Firstmate: recorded decision pending\nTask: " + $task + "\nKey: " + $key + "\n" + $text[:2800] + "\nReply with !fm note and include the task/key, or quote this alert.")}'
+        '{id:$id,text:("Firstmate: recorded decision pending\nTask: " + $task + "\nKey: " + $key + "\n" + $text[:2800] + "\nReply directly and include the task/key, or quote this alert.")}'
     done < <(status_open_decisions "$FM_AFK_CONTRACT_STATE/$task.status")
   done
 )
