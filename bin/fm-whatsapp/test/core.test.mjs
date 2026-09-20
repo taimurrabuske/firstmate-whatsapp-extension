@@ -189,6 +189,43 @@ test('contextual reply uses persisted sent context, ignores attacker-supplied qu
   assert.ok(!f.calls.inbox[1].text.includes('Reply to Firstmate:'));
 });
 
+test('request lifecycle is durable, contextual followups stay on route, and receipts expose IDs without claiming completion', async t => {
+  const f = fixture(t);
+  await f.bridge.receive(batch(message('start a long check', { id: 'LIFE1' })));
+  const first = sha256(`${identity.account}\nLIFE1`);
+  assert.equal(readJson(f.store.file(`requests/${first}.json`)).state, 'received');
+  assert.ok(f.store.records('outbox').map(x => readJson(f.store.file(`outbox/${x}`)).text)
+    .some(text => text.includes(first.slice(0, 12)) && !/completed/i.test(text)));
+  const restarted = new Bridge({ store: new Store(f.home, f.state), clock: () => 1010,
+    inbox: async (key, text) => f.calls.inbox.push({ key, text }), status: async () => 'status',
+    events: async () => f.snapshot, send: async () => true });
+  restarted.connect(user);
+  await restarted.receive(batch(message('also inspect its logs', { id: 'LIFE2' })));
+  assert.match(f.calls.inbox.at(-1).text, new RegExp(first));
+  restarted.peer = { account: '15555550999@s.whatsapp.net', aliases: ['15555550999@s.whatsapp.net'] };
+  const remote = message('different route', { id: 'ROUTE2', remoteJid: restarted.peer.account, fromMe: false });
+  await restarted.receive(batch(remote));
+  assert.ok(!f.calls.inbox.at(-1).text.includes(first));
+});
+
+test('decision replies require exact delivered metadata and reject stale or ambiguous approval context', async t => {
+  const f = fixture(t);
+  f.snapshot.events = [{ id: 'task:choice', kind: 'decision', task: 'task', key: 'choice', text: 'Choose A or B' }];
+  await f.bridge.refresh(); await f.bridge.flush();
+  const alertId = f.calls.sent[0].id;
+  await f.bridge.receive(batch(message('approve', { id: 'AMBIG' })));
+  assert.equal(f.calls.inbox.length, 0);
+  const exact = message('Choose A', { id: 'EXACT' }, { message: { extendedTextMessage: { text: 'Choose A',
+    contextInfo: { stanzaId: alertId, participant: user.id } } } });
+  await f.bridge.receive(batch(exact));
+  assert.equal(f.calls.inbox.length, 1);
+  assert.match(f.calls.inbox[0].text, /task=task key=choice/);
+  f.snapshot.events = []; await f.bridge.refresh();
+  await f.bridge.receive(batch(message('Choose B', { id: 'STALE' }, { message: { extendedTextMessage: { text: 'Choose B',
+    contextInfo: { stanzaId: alertId, participant: user.id } } } })));
+  assert.equal(f.calls.inbox.length, 1);
+});
+
 test('events notify once per session; offline queue persists and retries with same remote identity', async t => {
   const f = fixture(t);
   f.snapshot.events = [{ id: 'decision-1', text: 'A recorded decision needs your reply.' }];

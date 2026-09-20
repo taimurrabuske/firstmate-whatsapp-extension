@@ -12,12 +12,12 @@ Treat the body as a phone message, not a desk-return signal.
 Do not archive an AFK contract merely because the captain replied by phone.
 
 Read the complete request and any quoted question context.
-Apply Firstmate's existing authority checks to the current task and decision key.
+Apply Firstmate's existing authority checks to the current task and decision key. A decision response is valid only when the envelope carries the exact persisted task/key mapping from a quoted, still-open delivered alert. Refuse stale or ambiguous approval context and route an accepted response through Firstmate's normal decision procedure; this extension never decides or executes it.
 The extension does not grant merge, spending, or other action authority.
 Do not infer approval from delivery receipts or silence.
 Deduplicate repeated receipt markers if an operator has manually replayed a request.
 
-Send a concise acknowledgement for long work, then send its result using this extension's `bin/fm-whatsapp.sh reply <message-key>`, with the response supplied on stdin.
+The envelope exposes a durable request ID. Saving or acknowledging its inbox note is only `received`, never evidence of completion. For long work, the integration owner should call `FirstmateAdapter.progress(messageKey, state, text)` with `picked-up`, `working`, `waiting`, or `failed`; the parent CLI may expose an equivalent command. Send the successful final result using this extension's `bin/fm-whatsapp.sh reply <message-key>`, with the response supplied on stdin; final `reply` records `completed`.
 Use the explicit `FM_HOME`, `FM_CODE_ROOT`, and `FM_DELEGATE_STATE` carried by the local adapter's envelope.
 Invoke the script directly, without interpolating message text into shell command text.
 Use the exact message key and reply arguments from the adapter's JSON envelope.

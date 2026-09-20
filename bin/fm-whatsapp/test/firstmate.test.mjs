@@ -109,6 +109,51 @@ test('enable requires fresh connection; disable changes extension state only', t
   assert.deepEqual(fs.readdirSync(f.home), []); assert.ok(!result.stdout.includes('secret-account'));
 });
 
+test('explicit progress is durable, transition-checked, and reply is the only final completion API', async t => {
+  const f = fixture(t), route = { account: '15555550123@s.whatsapp.net', recipient: '15555550123@s.whatsapp.net' };
+  writeJson(f.store.file('identity.json'), { account: route.account, pairedAt: 1 });
+  const adapter = new FirstmateAdapter({ ...f.options, run: async () => '' });
+  adapter.requests.receive(key, { route, text: 'bounded request' });
+  writeJson(f.store.file(`handoffs/${key}.json`), { id: 'note-1', phase: 'saved', route,
+    binding: { home: fs.realpathSync(f.home), codeRoot: path.resolve(f.options.codeRoot), state: path.resolve(f.options.state) } });
+  assert.equal(adapter.progress(key, 'working', 'Running recorded checks.').state, 'working');
+  assert.throws(() => adapter.progress(key, 'received'), /use reply/);
+  assert.throws(() => adapter.progress(key, 'picked-up'), /invalid request transition/);
+  adapter.reply(key, 'Checks passed.');
+  assert.equal(adapter.requests.get(key).state, 'completed');
+  assert.throws(() => adapter.progress(key, 'waiting'), /invalid request transition/);
+  assert.equal(f.store.records('outbox').length, 2);
+});
+
+test('maintenance only re-rings an existing stale note with a strict bound and records handled evidence', async t => {
+  const f = fixture(t), calls = [], route = { account: '15555550123@s.whatsapp.net', recipient: '15555550123@s.whatsapp.net' };
+  writeJson(f.store.file('identity.json'), { account: route.account, pairedAt: 1 });
+  const adapter = new FirstmateAdapter({ ...f.options, run: async (file, args) => { calls.push({ file, args }); return ''; } });
+  adapter.requests.receive(key, { route, text: 'do not duplicate' });
+  const body = adapter.envelope(key, 'do not duplicate'); saveNote(f, body, 'note-1');
+  writeJson(f.store.file(`handoffs/${key}.json`), { id: 'note-1', body, phase: 'saved', route, created: 1,
+    maintenance: { rings: 0, last: 0 } });
+  await adapter.maintain({ now: 1000, staleAfter: 10, maxRings: 1 });
+  assert.equal(calls.length, 1); assert.equal(calls[0].file, '/bin/bash');
+  const report = await adapter.maintain({ now: 2000, staleAfter: 10, maxRings: 1 });
+  assert.equal(calls.length, 1); assert.equal(report[0].evidence, 'controller watcher stale');
+  fs.mkdirSync(path.join(f.home, 'state/inbox/handled'));
+  fs.renameSync(path.join(f.home, 'state/inbox/note-1.note'), path.join(f.home, 'state/inbox/handled/note-1.note'));
+  await adapter.maintain({ now: 3000, staleAfter: 10, maxRings: 1 });
+  assert.equal(adapter.requests.get(key).state, 'waiting'); // Inbox handling is not evidence that stalled work resumed.
+});
+
+test('request summaries paginate recorded facts without silently truncating', t => {
+  const f = fixture(t), route = { account: '15555550123@s.whatsapp.net', recipient: '15555550123@s.whatsapp.net' };
+  writeJson(f.store.file('identity.json'), { account: route.account, pairedAt: 1 });
+  const adapter = new FirstmateAdapter({ ...f.options, run: async () => '' });
+  for (let i = 0; i < 10; i++) adapter.requests.receive(sha256(`request-${i}`), { route, text: `request ${i}` });
+  const first = adapter.requests.summarize('pending', route);
+  assert.match(first, /Send more for 2 more/);
+  const rest = adapter.requests.summarize('more', route);
+  assert.equal(rest.split('\n').length, 2);
+});
+
 test('existing real Firstmate inbox integration in an isolated home', { skip: !process.env.FM_TEST_CODE_ROOT }, async t => {
   const f = fixture(t); const calls = [];
   const adapter = new FirstmateAdapter({ ...f.options, run: async (...args) => { calls.push(args[0]); return execute(...args); } });

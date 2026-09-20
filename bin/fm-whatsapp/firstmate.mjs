@@ -3,7 +3,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
-import { privateDirectory, readJson, writeJson, sha256, sameRoute } from './core.mjs';
+import { privateDirectory, readJson, writeJson, sha256, sameRoute, epoch, validText } from './core.mjs';
+import { RequestJournal, REQUEST_STATES } from './requests.mjs';
 
 export function execute(file, args, { env, input } = {}) {
   return new Promise((resolve, reject) => {
@@ -28,6 +29,7 @@ export class FirstmateAdapter {
     this.env = { ...env, FM_HOME: home, FM_CODE_ROOT: codeRoot, FM_ROOT_OVERRIDE: codeRoot,
       FM_STATE_OVERRIDE: state, FM_DELEGATE_STATE: path.dirname(store.root) };
     privateDirectory(store.file('handoffs'));
+    this.requests = new RequestJournal(store);
   }
   envelope(key, text) {
     return `[firstmate-whatsapp-message:${key}]\n` +
@@ -90,7 +92,7 @@ export class FirstmateAdapter {
     const found = this.findNote(key, body);
     if (found) {
       receipt = { route: receipt?.route ?? route, binding: receipt?.binding ?? binding, body, textDigest: digest, id: found.id, phase: found.handled ? 'handled' : 'saved',
-        announced: receipt?.announced === true };
+        created: receipt?.created ?? epoch(), announced: receipt?.announced === true, maintenance: receipt?.maintenance ?? { rings: 0, last: 0 } };
       writeJson(receiptFile, receipt);
       if (!found.handled && !receipt.announced) {
         await this.ring(found.id);
@@ -100,7 +102,8 @@ export class FirstmateAdapter {
     }
     if (receipt?.id) return; // A published note may have been retired; never recreate it.
     if (receipt) throw uncertain('previous note publication is uncertain; retained for inspection');
-    receipt = { route, binding, body, textDigest: digest, phase: 'calling', announced: false };
+    receipt = { route, binding, body, textDigest: digest, phase: 'calling', created: epoch(), announced: false,
+      maintenance: { rings: 0, last: 0 } };
     writeJson(receiptFile, receipt);
     let output = '', succeeded = false;
     try {
@@ -123,23 +126,81 @@ export class FirstmateAdapter {
       receipt.announced = true; writeJson(receiptFile, receipt);
     }
   }
-  reply(key, text) {
+  requestReceipt(key) {
     if (!/^[a-f0-9]{64}$/.test(key)) throw new Error('invalid transport message identity');
     const receipt = readJson(this.store.file(`handoffs/${key}.json`));
     const accepted = this.store.incoming(key) ?? readJson(this.store.file(`pending/${key}.json`));
     const current = this.store.currentRoute();
-    // The published handoff keeps its authenticated route after short-lived inbound
-    // deduplication receipts expire, so long-running work can still return a result.
     if (!receipt || !['saved', 'handled'].includes(receipt.phase) || !safeId(receipt.id) ||
         (accepted && (accepted.operation !== 'note' || !sameRoute(accepted.route, receipt.route))) ||
-        !sameRoute(receipt.route, current)) {
-      throw new Error('reply requires a published authenticated request on the current route');
-    }
+        !sameRoute(receipt.route, current)) throw new Error('reply requires a published authenticated request on the current route');
     const binding = receipt.binding;
     if (binding?.home !== fs.realpathSync(this.home) || binding?.codeRoot !== path.resolve(this.codeRoot) ||
         binding?.state !== path.resolve(this.state)) throw new Error('request belongs to another Firstmate configuration');
-    return this.store.enqueue(text, { kind: 'reply', session: '', route: current, requestKey: key,
+    return { receipt, current };
+  }
+  reply(key, text) {
+    if (!/^[a-f0-9]{64}$/.test(key)) throw new Error('invalid transport message identity');
+    if (!validText(text)) throw new Error('invalid reply text');
+    const { current } = this.requestReceipt(key);
+    const request = this.requests.get(key);
+    if (request?.state === 'failed') throw new Error('failed request cannot be completed');
+    const queued = this.store.enqueue(text, { kind: 'reply', session: '', route: current, requestKey: key,
       id: `response:${key}:${sha256(text)}` });
+    if (request && request.state !== 'completed') this.requests.transition(key, 'completed', text);
+    return queued;
+  }
+  progress(key, state, text = '') {
+    if (!REQUEST_STATES.includes(state) || ['received', 'completed'].includes(state)) throw new Error('use reply for final completion');
+    const { current } = this.requestReceipt(key);
+    const record = this.requests.transition(key, state, text);
+    const label = text ? `${state}: ${text}` : state;
+    this.store.enqueue(`Request ${key.slice(0, 12)} ${label}`, { kind: 'reply', session: '', route: current,
+      requestKey: key, id: `progress:${key}:${record.updated}:${state}:${sha256(text)}` });
+    return record;
+  }
+  async maintain({ now = epoch(), staleAfter = 300, maxRings = 3 } = {}) {
+    const reports = [];
+    for (const name of fs.readdirSync(this.store.file('handoffs')).filter(x => /^[a-f0-9]{64}\.json$/.test(x))) {
+      const file = this.store.file(`handoffs/${name}`), receipt = readJson(file);
+      if (!receipt?.id || !['saved', 'handled'].includes(receipt.phase)) continue;
+      const found = this.findNote(name.slice(0, -5), receipt.body);
+      if (found?.handled) {
+        if (receipt.phase !== 'handled') { receipt.phase = 'handled'; writeJson(file, receipt); }
+        const request = this.requests.get(name.slice(0, -5));
+        if (request?.state === 'received') this.requests.transition(request.key, 'picked-up', 'Firstmate inbox recorded handling.');
+        continue;
+      }
+      const maintenance = receipt.maintenance ?? { rings: 0, last: 0 };
+      if (now - (receipt.created ?? now) < staleAfter || now - maintenance.last < staleAfter) continue;
+      const requestKey = name.slice(0, -5);
+      const markWaiting = evidence => {
+        const request = this.requests.get(requestKey);
+        if (request && request.state !== 'waiting' && !['completed', 'failed'].includes(request.state))
+          this.requests.transition(requestKey, 'waiting', evidence);
+      };
+      if (maintenance.rings >= maxRings) { markWaiting('Controller watcher stale.');
+        reports.push({ key: requestKey, state: 'waiting', evidence: 'controller watcher stale' }); continue; }
+      // Re-ring the exact existing inbox identity only. Never publish or execute the request again.
+      try { await this.ring(receipt.id); maintenance.rings++; maintenance.last = now; receipt.maintenance = maintenance; writeJson(file, receipt);
+        markWaiting('Existing note re-rung; awaiting controller.');
+        reports.push({ key: requestKey, state: 'waiting', evidence: 'existing note re-rung' }); }
+      catch { markWaiting('Controller watcher busy.'); reports.push({ key: requestKey, state: 'waiting', evidence: 'controller watcher busy' }); }
+    }
+    return reports;
+  }
+  async summary(command = 'status') {
+    const route = this.store.currentRoute();
+    if (command === 'status') {
+      const rows = this.requests.list(route), open = rows.filter(x => !['completed', 'failed'].includes(x.state));
+      return `${open.length} open request(s), ${rows.length} recorded. ${String(await this.status()).trim()}`.slice(0, 3500);
+    }
+    if (command === 'decisions') {
+      const snapshot = await this.events();
+      const decisions = snapshot.events.filter(x => x.kind === 'decision' || (x.task && x.key));
+      return decisions.length ? decisions.map(x => `${x.task}/${x.key}: ${x.text}`).join('\n').slice(0, 3500) : 'No recorded open decisions.';
+    }
+    return this.requests.summarize(command, route);
   }
   status() {
     return this.run(path.join(this.codeRoot, 'bin/fm-inbox.sh'), ['status'], { env: this.env });

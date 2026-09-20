@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import os from 'node:os';
+import { RequestJournal } from './requests.mjs';
 
 export const MAX_TEXT = 3500;
 export const MAX_QUEUE = 100;
@@ -71,8 +72,8 @@ export function validText(text) {
 }
 export function parseRequest(text) {
   if (!validText(text)) return null;
-  const shortcut = /^(?:!fm\s+)?(status|help)$/i.exec(text.trim());
-  if (shortcut) return { operation: shortcut[1].toLowerCase() };
+  const shortcut = /^(?:!fm\s+)?(status|help|pending|blocked|decisions|more|last result)$/i.exec(text.trim());
+  if (shortcut) return { operation: shortcut[1].toLowerCase() === 'help' ? 'help' : 'summary', command: shortcut[1].toLowerCase() };
   const legacyNote = /^!fm\s+note\s+([\s\S]+)$/i.exec(text);
   return { operation: 'note', text: legacyNote ? legacyNote[1] : text };
 }
@@ -116,6 +117,8 @@ export function validateSnapshot(value) {
   if (value.afk && !value.session) throw new Error('missing away session');
   for (const event of value.events) {
     if (typeof event.id !== 'string' || !event.id || event.id.length > 512 || !validText(event.text)) throw new Error('invalid event');
+    if (event.kind != null && !['decision', 'alert'].includes(event.kind)) throw new Error('invalid event metadata');
+    for (const field of ['task', 'key']) if (event[field] != null && (typeof event[field] !== 'string' || !/^[A-Za-z0-9._:-]{1,200}$/.test(event[field]))) throw new Error('invalid event metadata');
   }
   return value;
 }
@@ -157,7 +160,7 @@ export class Store {
       if (record.at < now - 86400) fs.unlinkSync(this.file(`incoming/${file}`));
     }
   }
-  enqueue(text, { kind = 'alert', session, id = crypto.randomUUID(), automatic = false, route, requestKey, now = epoch() } = {}) {
+  enqueue(text, { kind = 'alert', session, id = crypto.randomUUID(), automatic = false, route, requestKey, event, now = epoch() } = {}) {
     if (!validText(text) || !['alert', 'reply'].includes(kind) || typeof session !== 'string') throw new Error('invalid outbound message');
     const queueLock = this.file('queue.lock');
     try { fs.mkdirSync(queueLock, { mode: 0o700 }); }
@@ -169,7 +172,8 @@ export class Store {
       if (this.records('outbox').length >= MAX_QUEUE) throw new Error('outbound queue full');
       // Independent immutable queue entries permit notify while run holds its process lock.
       const temp = this.file(`outbox/.${crypto.randomUUID()}.tmp`);
-      writeJson(temp, { key, kind, session, text, automatic, route, requestKey, eventId: id, created: now, attempts: 0, next: 0,
+      writeJson(temp, { key, kind, session, text, automatic, route, requestKey, eventId: id,
+        event: event ? { kind: event.kind, task: event.task, key: event.key } : undefined, created: now, attempts: 0, next: 0,
         remoteId: `3EB0${crypto.randomBytes(14).toString('hex').toUpperCase()}` });
       try { fs.linkSync(temp, target); }
       catch (error) { if (error.code !== 'EEXIST') throw error; }
@@ -223,8 +227,9 @@ export class Store {
 }
 
 export class Bridge {
-  constructor({ store, inbox, status, events, send, peer = null, clock = epoch }) {
-    Object.assign(this, { store, inbox, status, events, send, peer, clock });
+  constructor({ store, inbox, status, summary = null, events, send, peer = null, clock = epoch }) {
+    Object.assign(this, { store, inbox, status, summary, events, send, peer, clock });
+    this.requests = new RequestJournal(store, clock);
     this.identity = null;
     this.connected = false;
     this.snapshot = { afk: false, session: '', events: [] };
@@ -261,7 +266,7 @@ export class Bridge {
       this.store.expire(this.snapshot, this.clock());
       if (this.snapshot.afk) {
         for (const event of this.snapshot.events) this.store.enqueue(event.text,
-          { session: this.snapshot.session, id: event.id, automatic: true, now: this.clock() });
+          { session: this.snapshot.session, id: event.id, event, automatic: true, now: this.clock() });
       }
     } catch {
       this.snapshot = { afk: false, session: '', events: [] };
@@ -281,18 +286,38 @@ export class Bridge {
       const request = parseRequest(incoming.text);
       if (!request) continue;
       const operation = request.operation;
-      let body = '';
-      if (operation === 'note') {
-        const quoted = this.store.sentByRemoteId(incoming.quotedId);
-        const context = quoted ? `\nReply to Firstmate: ${quoted.text}\n` : '\n';
-        body = `WhatsApp phone note (remote; remain away).${context}\n${request.text}`;
-      }
+      const route = { account: this.identity.account, recipient: (this.peer ?? this.identity).account };
       if (this.store.records('pending').length >= MAX_QUEUE) {
         this.problem = 'incoming queue full; new messages require retry'; this.health(); break;
       }
-      writeJson(file, { key: incoming.key, account: this.identity.account,
-        route: { account: this.identity.account, recipient: (this.peer ?? this.identity).account },
-        operation, body, attempts: 0, next: 0 });
+      let body = '', decision = null;
+      if (operation === 'note') {
+        const quoted = this.store.sentByRemoteId(incoming.quotedId);
+        const quoteMatches = quoted && sameRoute(quoted.deliveredRoute ?? quoted.route, route);
+        if (!quoteMatches && /^(?:yes|no|approve|approved|reject|denied|choose\b|option\b)/i.test(request.text.trim()) &&
+            this.snapshot.events.some(event => event.kind === 'decision')) {
+          writeJson(file, { key: incoming.key, account: this.identity.account, route, operation: 'local-reply',
+            response: 'Approval context is ambiguous. Quote the exact current decision alert; nothing was forwarded or decided.', attempts: 0, next: 0 });
+          continue;
+        }
+        if (quoteMatches && quoted.event?.kind === 'decision') {
+          const active = this.snapshot.events.some(event => event.kind === 'decision' && event.task === quoted.event.task && event.key === quoted.event.key);
+          if (!active) {
+            writeJson(file, { key: incoming.key, account: this.identity.account, route, operation: 'local-reply',
+              response: `Decision context is stale or no longer recorded (${quoted.event.task}/${quoted.event.key}); no approval was forwarded.`, attempts: 0, next: 0 });
+            continue;
+          }
+          decision = { task: quoted.event.task, key: quoted.event.key, eventId: quoted.eventId };
+        }
+        const quoteContext = quoteMatches ? `\nPersisted quoted Firstmate message: ${quoted.text}\n` : '\n';
+        const recent = !quoteMatches ? this.requests.recentContext(route, { exclude: incoming.key }).map(x => `${x.key}:${x.state}`).join(', ') : '';
+        body = `Remote request ID: ${incoming.key}\nWhatsApp phone note (remote; remain away).${quoteContext}` +
+          (decision ? `Exact recorded decision context: task=${decision.task} key=${decision.key}. Route through Firstmate's normal decision handling.\n` : '') +
+          (recent ? `Related open request IDs on this exact route (context only): ${recent}\n` : '') + `\n${request.text}`;
+        this.requests.receive(incoming.key, { route, text: request.text, quoted: quoteMatches ? quoted.requestKey ?? quoted.eventId : null, decision });
+      }
+      writeJson(file, { key: incoming.key, account: this.identity.account, route,
+        operation, command: request.command, body, attempts: 0, next: 0 });
     }
   }
   async receive(batch) {
@@ -313,12 +338,13 @@ export class Bridge {
           { account: this.identity.account, recipient: (this.peer ?? this.identity).account }))) throw new Error('pending route mismatch');
         if (this.store.records('incoming').length >= MAX_SEEN) throw new Error('incoming receipt limit reached');
         let response;
-        if (job.operation === 'status') response = (await this.status()).slice(0, MAX_TEXT);
+        if (job.operation === 'summary') response = String(await (this.summary ? this.summary(job.command) : this.status(job.command))).slice(0, MAX_TEXT);
         else if (job.operation === 'help') {
-          response = 'Send your instruction directly—no prefix needed. Send status for recorded fleet status or help for this guide. Reply to a Firstmate message to include its context. Phone messages do not end away mode. Decisions still need explicit supervisor handling.';
-        } else if (job.operation === 'note') {
+          response = 'Send your instruction directly—no prefix needed. Shortcuts: status, pending, blocked, decisions, last result, more, help. Quote a Firstmate alert for exact context. Phone messages do not end away mode; decisions still require supervisor handling and normal gates.';
+        } else if (job.operation === 'local-reply') response = job.response;
+        else if (job.operation === 'note') {
           await this.inbox(job.key, job.body);
-          response = 'Your note is saved for Firstmate. Away mode is unchanged; this receipt does not mean any action was approved or completed.';
+          response = `Request ${job.key.slice(0, 12)} received and saved for Firstmate. State: received. Completion requires an explicit Firstmate result.`;
         } else throw new Error('invalid pending operation');
         this.store.enqueue(response, { kind: 'reply', session: '', id: job.key, now: this.clock() });
         this.store.markIncoming(job.key, this.clock(), job);
@@ -356,7 +382,8 @@ export class Bridge {
       try {
         const delivered = await this.send((this.peer ?? this.identity).account, `${PREFIX}${job.text}`, job.remoteId);
         if (!delivered) throw new Error('unconfirmed send');
-        writeJson(this.store.file(`sent/${file}`), { ...job, delivered: this.clock() });
+        writeJson(this.store.file(`sent/${file}`), { ...job,
+          deliveredRoute: { account: this.identity.account, recipient: (this.peer ?? this.identity).account }, delivered: this.clock() });
         fs.unlinkSync(location);
         this.problem = '';
       } catch {
