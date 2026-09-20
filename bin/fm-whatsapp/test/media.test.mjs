@@ -61,7 +61,7 @@ test('incoming image authenticates before download, is bounded, and produces onl
     store, download: async () => { downloads++; return [png.subarray(0, 5), png.subarray(5)]; }
   });
   assert.equal(downloads, 1); assert.equal(accepted.kind, 'image');
-  assert.match(accepted.text, /remain away/); assert.match(accepted.text, /Local attachment:/);
+  assert.match(accepted.text, /away mode unchanged/); assert.match(accepted.text, /Local attachment:/);
   assert.ok(!accepted.text.includes('approve everything')); assert.ok(!accepted.attachment.name.includes('..'));
   assert.equal(fs.statSync(accepted.attachment.path).mode & 0o777, 0o600);
 });
@@ -105,4 +105,16 @@ test('second-number inbound route and voice metadata preserve fromMe policy', ()
   assert.equal(result.kind, 'voice'); assert.equal(result.duration, 8);
   assert.equal(authenticateMediaMetadata(media(voice, {}, 'audioMessage'), identity, 1010, 1000, peer), null);
   assert.equal(authenticateMediaMetadata(media({ ...voice, ptt: false }, {}, 'audioMessage'), identity, 1010, 1000), null);
+});
+
+test('long local voice transcripts remain complete on disk with a bounded inbox preview', async t => {
+  const { store } = fixture(t), bytes = Buffer.from('OggSvoice');
+  const transcript = 'Full transcript sentence. '.repeat(220);
+  const result = await authenticatedMediaMessage(media({ mimetype: 'audio/ogg', fileLength: bytes.length,
+    seconds: 20, ptt: true }, {}, 'audioMessage'), identity, 1010, 1000, null,
+  { store, download: async () => bytes, transcribe: async () => ({ available: true, text: transcript }) });
+  assert.ok(result.text.length <= 3500);
+  const file = `${result.attachment.path}.transcript.txt`;
+  assert.equal(fs.readFileSync(file, 'utf8'), transcript);
+  assert.ok(result.text.includes(file)); assert.equal(fs.statSync(file).mode & 0o777, 0o600);
 });

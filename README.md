@@ -8,7 +8,7 @@ The computer running Firstmate must stay online; existing agent and connectivity
 Firstmate's repository stays unchanged.
 The extension uses its installed inbox, AFK validator, status classifier, and wake library.
 It does not copy Firstmate source or change its permissions, AFK schema, or supervisor ownership.
-Telegram is a possible fallback, not a dependency of this WhatsApp setup; no BotFather account or token is needed.
+Telegram fallback is implemented but optional and inactive until explicitly paired. WhatsApp needs no Telegram account or bot token.
 
 ## Install and pair
 
@@ -60,12 +60,15 @@ Firstmate retains hold-for-return behavior whenever a response is unavailable.
 In the configured chat (Message yourself by default, or the chat with the linked account from your second number):
 
 - `status` reads recorded fleet status without waking Firstmate.
+- `pending`, `blocked`, and `last result` show this chat's recorded remote requests, progress, and outcomes.
+- `decisions` reads currently open Firstmate decisions, including outside AFK.
+- `more` continues the previous long summary.
 - `Please check the failing simulation` saves a request and wakes the existing supervisor.
 - `help` shows the command summary.
 - Reply to a delivered Firstmate question to include its persisted context with your answer.
 
 No prefix is required: ordinary text goes directly to Firstmate as a request.
-Only the exact words `status` and `help` are local shortcuts, ignoring case and surrounding whitespace.
+These exact summary commands and the notification preferences below are local shortcuts, ignoring case and surrounding whitespace.
 The older `!fm status`, `!fm help`, and `!fm note TEXT` forms remain accepted.
 
 The supervisor must be running and handling its inbox to answer conversational requests.
@@ -73,6 +76,24 @@ Each note includes the path to this extension's [supervisor skill](skills/whatsa
 No installation into Firstmate's tracked skill directory is required.
 Phone messages do not themselves end AFK mode or execute decisions.
 The bridge's immediate “saved” receipt is distinct from Firstmate's eventual answer.
+Requests now have durable IDs and explicit `received`, `picked-up`, `working`, `waiting`, `completed`, or `failed` states. Recent requests and answers supply bounded context to unquoted followups on the same authenticated route. Only the controller's explicit final reply records completion. An unanswered request can re-ring its existing wake up to three times; it never creates a second request or takes controller ownership. See [request lifecycle](docs/requests.md).
+
+Send a screenshot, a supported document, or a voice note from the same allowed chat. Voice transcription runs locally using ffmpeg and whisper.cpp when [configured](docs/media.md). Media is privately staged before handoff; limits are 8 MiB for images, 15 MiB for documents, and 10 MiB / five minutes for voice. Captions are not executed as commands: send accompanying instructions as a separate text message. Forwarded, view-once, and wrapped media are refused.
+
+## Notifications
+
+Completions, failures, and open decisions can alert during confirmed AFK sessions. Progress alerts default off. Preferences persist locally:
+
+```text
+alerts
+alerts progress on
+unsubscribe project PROJECT
+subscribe task TASK
+quiet 22:00-08:00 America/New_York
+digest 15
+```
+
+Task preferences override project preferences; unspecified tasks/projects remain subscribed. Use `alerts off`, `quiet off`, or `digest 0` to disable each feature. Decisions bypass the digest timer by default, but still respect quiet hours; `alerts decisions urgent off` delays them too. Decisions always arrive separately so quoting one identifies its exact task/key. Long digests retain complete events across multiple messages. Returning from AFK expires its unsent proactive alerts. Direct request replies remain available. [Notification details](docs/notifications.md).
 
 ## Connect the controlling Firstmate
 
@@ -146,12 +167,24 @@ printf '%s\n' 'The simulation finished; the result meets the stated target.' |
 
 `reply` requires a published authenticated request on the current account, recipient, and Firstmate configuration.
 It refuses unknown message keys, uncertain handoffs, and route changes.
-Identical responses to the same request are deduplicated; different acknowledgements and final answers can both be sent.
+Identical responses to the same request are deduplicated. For acknowledgement and progress, use `progress MESSAGE_KEY picked-up|working|waiting|failed` with detail on stdin. Use `reply` for the successful final result. Use `reply-file MESSAGE_KEY /absolute/report.pdf` to attach a requested report or plot, followed by the final text reply.
 Use `notify` for proactive messages during confirmed AFK sessions.
 
 Ordinary help/status/receipt replies work while the bridge is running, including outside AFK.
-Automatic notices cover unresolved recorded `needs-decision` keys for tasks that still have metadata.
-General progress is available through status and supervisor replies.
+Automatic notices cover current decisions and new completion/failure/progress records for tasks that still have local metadata. The first observation of an AFK session suppresses historical outcomes. Fleet status and remote request lifecycle are separate views.
+
+## Optional Telegram fallback
+
+WhatsApp remains the primary transport. Telegram makes no network requests until configured. If needed, create a bot through Telegram's official @BotFather, store its token in an absolute, owner-only mode-600 local file, and obtain your exact numeric Telegram user ID through a trusted local account/session. Stop the bridge, finish queued work, and run:
+
+```bash
+./bin/fm-whatsapp.sh telegram-config /absolute/private/bot-token TELEGRAM_USER_ID
+./bin/fm-whatsapp.sh run
+```
+
+Start a private conversation with your bot from that user. Only that exact user/private chat is accepted; groups, forwarded messages, and other users are ignored. The token never belongs in chat, command arguments, Git, or logs. Telegram accepts text requests and the same summaries/preferences, and can return text or requested report files. Incoming voice/media currently use WhatsApp.
+
+After a two-minute WhatsApp outage, newly queued responses with an explicitly bound Telegram fallback may be delivered there. Older unbound messages are held on their original route. Pairing or token changes cannot redirect old replies to a new recipient. Telegram continues running when WhatsApp requires re-pairing, provided the bridge already has an authenticated WhatsApp identity. Proactive fallback alerts retain all AFK and preference gates. Telegram's server receipt does not prove human readership; a crash after a send but before its local receipt can duplicate a message. No paid messaging feature is used. Telegram is **not activated** by installing the addon.
 
 ## Private state and lifecycle
 
@@ -169,7 +202,7 @@ Do not launch a second copy against the same state directory.
 After an unclean shutdown, inspect a reported stale lock and confirm its process is gone before removing that lock directory.
 
 Inbound messages are accepted only from the selected private chat.
-Other contacts, groups, forwarded content, media, history, and arbitrary shell commands are ignored.
+Other contacts, groups, forwarded content, history, and unsupported media are ignored. Text is handed to the controller as a request, never evaluated as shell code by the bridge.
 Accepted requests are journaled before handing off to Firstmate.
 The adapter recovers already-published inbox notes instead of blindly submitting duplicates.
 If the inbox helper was interrupted and publication cannot be proved, the request stays pending for operator inspection.
@@ -193,4 +226,4 @@ FM_TEST_CODE_ROOT=/absolute/path/to/unchanged/firstmate node --test test/*.test.
 Transport tests use fake sockets and temporary homes.
 Integration tests use an installed Firstmate with temporary operational state and do not touch the real supervisor.
 Live pairing and a real phone round trip remain separate acceptance checks.
-WhatsApp can disconnect unofficial clients; if it cannot work for this account, a Telegram transport can be added to this independent repository.
+WhatsApp can disconnect unofficial clients; the optional paired Telegram fallback stays in this independent repository.

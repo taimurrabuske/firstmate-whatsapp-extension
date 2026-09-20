@@ -1,6 +1,6 @@
 # Media and offline voice integration
 
-`bin/fm-whatsapp/media.mjs` is transport-neutral and does not import Baileys or fetch URLs. The bridge must inject its authenticated Baileys downloader only after metadata filtering.
+`bin/fm-whatsapp/media.mjs` is transport-neutral and does not import Baileys or fetch URLs. The bridge injects its authenticated Baileys downloader only after metadata filtering. `MediaIntake` journals each accepted encrypted locator before asynchronous download/transcription, so a restart retains the intake and duplicate delivery cannot create another note.
 
 ## Exported API
 
@@ -25,7 +25,7 @@ All three paths must be absolute local regular files; executables must have an e
 
 `transcribeVoice` invokes both programs with `execFile` argument arrays (no shell), decodes mono 16 kHz audio capped at five minutes, bounds runtime and captured subprocess output, bounds transcript size, and removes its private temporary directory in `finally`. It returns `{available:true,text}` or an intelligible `{available:false,message}`; command stderr and local secrets are not exposed. The original bounded private voice attachment remains available when transcription fails.
 
-Recommended bridge wiring:
+The integrated bridge wiring:
 
 ```js
 const accepted = await authenticatedMediaMessage(message, identity, now, pairedAt, peer, {
@@ -36,3 +36,5 @@ const accepted = await authenticatedMediaMessage(message, identity, now, pairedA
 ```
 
 The caller remains responsible for durable deduplication before handoff, queueing the staged attachment with the authenticated reply route, and using its normal server-acknowledged send flow. Media acceptance does not change AFK state, approve work, or bypass Firstmate task/merge/spend gates.
+
+Long voice transcripts remain in a private `.transcript.txt` file; the inbox envelope includes its path and a bounded preview. The controller reads the full file. Use `voice-status` to inspect configuration. This installation can use the local English `base.en` model; no voice data is sent to a transcription service.

@@ -46,6 +46,8 @@ export function writeJson(file, value) {
   try { fs.writeFileSync(fd, `${JSON.stringify(value)}\n`); fs.fsyncSync(fd); }
   finally { fs.closeSync(fd); }
   fs.renameSync(temp, file);
+  const directory = fs.openSync(path.dirname(file), 'r');
+  try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
 }
 export function canonicalJid(jid) {
   if (typeof jid !== 'string') return null;
@@ -53,7 +55,8 @@ export function canonicalJid(jid) {
   return match ? `${match[1]}@${match[2]}` : null;
 }
 export function sameRoute(left, right) {
-  return Boolean(left && right && left.account === right.account && left.recipient === right.recipient);
+  return Boolean(left && right && left.account === right.account && left.recipient === right.recipient &&
+    (left.transport ?? 'whatsapp') === (right.transport ?? 'whatsapp') && left.credentialDigest === right.credentialDigest);
 }
 export function ownIdentity(user) {
   const account = canonicalJid(user?.id);
@@ -117,7 +120,8 @@ export function validateSnapshot(value) {
   if (value.afk && !value.session) throw new Error('missing away session');
   for (const event of value.events) {
     if (typeof event.id !== 'string' || !event.id || event.id.length > 512 || !validText(event.text)) throw new Error('invalid event');
-    if (event.kind != null && !['decision', 'alert'].includes(event.kind)) throw new Error('invalid event metadata');
+    if (event.kind != null && !['decision', 'alert', 'completion', 'failure', 'progress'].includes(event.kind)) throw new Error('invalid event metadata');
+    if (event.project != null && (typeof event.project !== 'string' || event.project.length > 256 || /[\x00-\x1f\x7f]/.test(event.project))) throw new Error('invalid event metadata');
     for (const field of ['task', 'key']) if (event[field] != null && (typeof event[field] !== 'string' || !/^[A-Za-z0-9._:-]{1,200}$/.test(event[field]))) throw new Error('invalid event metadata');
   }
   return value;
@@ -144,7 +148,7 @@ export class Store {
   records(name) { return fs.readdirSync(this.file(name)).filter(f => /^[a-f0-9]{64}\.json$/.test(f)).sort(); }
   incoming(key) { return readJson(this.file(`incoming/${key}.json`)); }
   markIncoming(key, now, request = {}) {
-    writeJson(this.file(`incoming/${key}.json`), { at: now, operation: request.operation, route: request.route });
+    writeJson(this.file(`incoming/${key}.json`), { at: now, operation: request.operation, route: request.route, fallbackRoute: request.fallbackRoute });
   }
   currentRoute() {
     const account = readJson(this.file('identity.json'))?.account;
@@ -160,7 +164,8 @@ export class Store {
       if (record.at < now - 86400) fs.unlinkSync(this.file(`incoming/${file}`));
     }
   }
-  enqueue(text, { kind = 'alert', session, id = crypto.randomUUID(), automatic = false, route, requestKey, event, now = epoch() } = {}) {
+  enqueue(text, { kind = 'alert', session, id = crypto.randomUUID(), automatic = false, route, requestKey, event,
+    sourceEvents, attachment, fallbackRoute, now = epoch() } = {}) {
     if (!validText(text) || !['alert', 'reply'].includes(kind) || typeof session !== 'string') throw new Error('invalid outbound message');
     const queueLock = this.file('queue.lock');
     try { fs.mkdirSync(queueLock, { mode: 0o700 }); }
@@ -172,12 +177,14 @@ export class Store {
       if (this.records('outbox').length >= MAX_QUEUE) throw new Error('outbound queue full');
       // Independent immutable queue entries permit notify while run holds its process lock.
       const temp = this.file(`outbox/.${crypto.randomUUID()}.tmp`);
-      writeJson(temp, { key, kind, session, text, automatic, route, requestKey, eventId: id,
+      writeJson(temp, { key, kind, session, text, automatic, route, requestKey, sourceEvents, attachment, fallbackRoute, eventId: id,
         event: event ? { kind: event.kind, task: event.task, key: event.key } : undefined, created: now, attempts: 0, next: 0,
         remoteId: `3EB0${crypto.randomBytes(14).toString('hex').toUpperCase()}` });
       try { fs.linkSync(temp, target); }
       catch (error) { if (error.code !== 'EEXIST') throw error; }
       finally { fs.unlinkSync(temp); }
+      const directory = fs.openSync(this.file('outbox'), 'r');
+      try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
       return key;
     } finally { fs.rmdirSync(queueLock); }
   }
@@ -189,7 +196,9 @@ export class Store {
       if (!job || job.kind !== 'alert') continue;
       let reason = '';
       if (!snapshot.afk || job.session !== snapshot.session) reason = 'away session ended or replaced';
-      else if (job.automatic && !active.has(job.eventId)) reason = 'recorded decision no longer open';
+      else if (job.automatic && (job.sourceEvents
+        ? job.sourceEvents.some(event => event.kind === 'decision' && !active.has(event.id))
+        : !active.has(job.eventId))) reason = 'recorded decision no longer open';
       if (!reason) continue;
       const receipts = readJson(this.file('expired.json'), []);
       receipts.push({ key: job.key, at: now, reason });
@@ -227,8 +236,9 @@ export class Store {
 }
 
 export class Bridge {
-  constructor({ store, inbox, status, summary = null, events, send, peer = null, clock = epoch }) {
-    Object.assign(this, { store, inbox, status, summary, events, send, peer, clock });
+  constructor({ store, inbox, status, summary = null, events, send, peer = null, clock = epoch,
+    notificationPolicy = null, localCommand = null, fallbackRoute = () => undefined }) {
+    Object.assign(this, { store, inbox, status, summary, events, send, peer, clock, notificationPolicy, localCommand, fallbackRoute });
     this.requests = new RequestJournal(store, clock);
     this.identity = null;
     this.connected = false;
@@ -264,7 +274,14 @@ export class Bridge {
     try {
       this.snapshot = validateSnapshot(await this.events());
       this.store.expire(this.snapshot, this.clock());
-      if (this.snapshot.afk) {
+      if (this.notificationPolicy) {
+        for (const delivery of this.notificationPolicy.plan(this.snapshot, this.clock())) {
+          this.store.enqueue(delivery.text, { session: delivery.session, id: delivery.id,
+            event: delivery.event, sourceEvents: delivery.sourceEvents, automatic: true,
+            route: this.store.currentRoute(), fallbackRoute: this.fallbackRoute(), now: this.clock() });
+          this.notificationPolicy.commit(delivery);
+        }
+      } else if (this.snapshot.afk) {
         for (const event of this.snapshot.events) this.store.enqueue(event.text,
           { session: this.snapshot.session, id: event.id, event, automatic: true, now: this.clock() });
       }
@@ -290,6 +307,12 @@ export class Bridge {
       if (this.store.records('pending').length >= MAX_QUEUE) {
         this.problem = 'incoming queue full; new messages require retry'; this.health(); break;
       }
+      const local = this.localCommand?.(incoming.text);
+      if (local?.recognized) {
+        writeJson(file, { key: incoming.key, account: this.identity.account, route, fallbackRoute: this.fallbackRoute(),
+          operation: 'local-reply', response: local.text, attempts: 0, next: 0 });
+        continue;
+      }
       let body = '', decision = null;
       if (operation === 'note') {
         const quoted = this.store.sentByRemoteId(incoming.quotedId);
@@ -311,13 +334,13 @@ export class Bridge {
         }
         const quoteContext = quoteMatches ? `\nPersisted quoted Firstmate message: ${quoted.text}\n` : '\n';
         const recent = !quoteMatches ? this.requests.recentContext(route, { exclude: incoming.key }) : '';
-        body = `Remote request ID: ${incoming.key}\nWhatsApp phone note (remote; remain away).${quoteContext}` +
+        body = `Remote request ID: ${incoming.key}\nWhatsApp phone note (remote; away mode unchanged).${quoteContext}` +
           (decision ? `Exact recorded decision context: task=${decision.task} key=${decision.key}. Route through Firstmate's normal decision handling.\n` : '') +
           (recent ? `Bounded recent conversation on this exact authenticated route (context only):\n${recent}\n` : '') + `\n${request.text}`;
         this.requests.receive(incoming.key, { route, text: request.text, quoted: quoteMatches ? quoted.requestKey ?? quoted.eventId : null, decision });
       }
       writeJson(file, { key: incoming.key, account: this.identity.account, route,
-        operation, command: request.command, body, attempts: 0, next: 0 });
+        fallbackRoute: this.fallbackRoute(), operation, command: request.command, body, attempts: 0, next: 0 });
     }
   }
   async receive(batch) {
@@ -346,7 +369,8 @@ export class Bridge {
           await this.inbox(job.key, job.body);
           response = `Request ${job.key.slice(0, 12)} received and saved for Firstmate. State: received. Completion requires an explicit Firstmate result.`;
         } else throw new Error('invalid pending operation');
-        this.store.enqueue(response, { kind: 'reply', session: '', id: job.key, now: this.clock() });
+        this.store.enqueue(response, { kind: 'reply', session: '', id: job.key, route: job.route,
+          fallbackRoute: job.fallbackRoute, now: this.clock() });
         this.store.markIncoming(job.key, this.clock(), job);
         fs.unlinkSync(file);
       } catch (error) {
@@ -369,7 +393,9 @@ export class Bridge {
       const location = this.store.file(`outbox/${file}`);
       const job = readJson(location);
       if (!job || job.next > this.clock()) continue;
+      if (job.route?.transport === 'telegram') continue;
       if (job.kind === 'alert' && (!gate.afk || job.session !== gate.session)) continue;
+      if (job.kind === 'alert' && this.notificationPolicy && !this.notificationPolicy.allow(job, gate, this.clock())) continue;
       if (job.route && !sameRoute(job.route, { account: this.identity.account, recipient: (this.peer ?? this.identity).account })) {
         this.problem = 'reply route changed; queued response retained for inspection'; this.health(); continue;
       }
@@ -380,7 +406,7 @@ export class Bridge {
       if (readJson(this.store.file(`sent/${file}`))) { fs.unlinkSync(location); continue; }
       this.lastSent = this.clock();
       try {
-        const delivered = await this.send((this.peer ?? this.identity).account, `${PREFIX}${job.text}`, job.remoteId);
+        const delivered = await this.send((this.peer ?? this.identity).account, `${PREFIX}${job.text}`, job.remoteId, job);
         if (!delivered) throw new Error('unconfirmed send');
         writeJson(this.store.file(`sent/${file}`), { ...job,
           deliveredRoute: { account: this.identity.account, recipient: (this.peer ?? this.identity).account }, delivered: this.clock() });

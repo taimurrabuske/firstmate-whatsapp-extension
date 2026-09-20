@@ -4,6 +4,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { FirstmateAdapter } from './firstmate.mjs';
+import { NotificationPolicy } from './notifications.mjs';
+import { stageAttachment, outboundContent, attachmentBytes } from './media.mjs';
+import { loadVoiceConfig, transcribeVoice } from './voice.mjs';
+import { MediaIntake } from './media-intake.mjs';
+import { TelegramDelegate, telegramStore, telegramConfig, configureTelegram } from './telegram.mjs';
 import { Acknowledgements, Bridge, Store, readJson, writeJson, delegateState, verifyHomeBinding, ownIdentity, canonicalJid, authenticatedMessage, validText, parseRequest, epoch, MAX_TEXT, validateSnapshot } from './core.mjs';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const help = `Usage: FM_HOME=/absolute/home bin/fm-whatsapp.sh <command>
@@ -11,6 +16,12 @@ const help = `Usage: FM_HOME=/absolute/home bin/fm-whatsapp.sh <command>
   run                            Run the self-chat bridge until stopped with SIGINT/SIGTERM.
   status                         Print private bridge health without connecting.
   reply <message-key>            Queue stdin response to an accepted phone request, including outside AFK.
+  progress <key> <state>         Report picked-up, working, waiting, or failed; detail on stdin.
+  reply-file <key> <file>        Send a local image/report for this request; optional caption on stdin.
+  summary <shortcut>            Read status, pending, blocked, decisions, last result, or more.
+  preferences <command>         Set alerts, subscriptions, quiet hours, or digest interval.
+  voice-status                  Check the local offline transcription setup.
+  telegram-config <file> <id>    Pair optional fallback using a private token file and exact user ID.
   notify                         Queue stdin text for the enabled delegate's current AFK session.
   enable                         Opt in to alerts while Firstmate is away (requires live bridge).
   disable                        Disable alerts; preserve credentials and saved notes.
@@ -23,7 +34,7 @@ FM_STATE_OVERRIDE selects Firstmate state only, never bridge credentials.
 Bridge records use FM_DELEGATE_STATE or XDG_STATE_HOME/firstmate-whatsapp/<home-hash>/whatsapp.
 Without XDG_STATE_HOME, ~/.local/state is used. State is bound to canonical FM_HOME.
 Only the configured recipient's private conversation is accepted; default is Message Yourself.
-Send instructions directly, without a prefix. Shortcuts: status, help. Legacy !fm commands still work.
+Send instructions directly, without a prefix. Shortcuts: status, pending, blocked, decisions, last result, more, help.
 Stop never logs the device out. Unlink it in WhatsApp's Linked devices when retiring it.
 Pending sends remain queued on failure; remote acceptance does not prove a human read.
 A remote-send/local-receipt crash can duplicate a notification, never create approval authority.
@@ -43,9 +54,13 @@ export function safeHealth(state, now = epoch()) {
     pending: data?.pending ?? 0, uncertain: data?.uncertain ?? 0,
     problem: fresh ? (data.problem || '') : 'bridge is not running or health is stale' };
 }
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const command = argv.shift() || 'help';
-  let qrFile, recipient, messageKey;
+  let qrFile, recipient, messageKey, progressState, attachmentFile, value, tokenFile, userId;
+  if (command === 'progress' && argv.length === 2) [messageKey, progressState] = argv.splice(0);
+  if (command === 'reply-file' && argv.length === 2) [messageKey, attachmentFile] = argv.splice(0);
+  if (['summary', 'preferences'].includes(command) && argv.length) value = argv.splice(0).join(' ');
+  if (command === 'telegram-config' && argv.length === 2) [tokenFile, userId] = argv.splice(0);
   if (command === 'reply' && argv.length === 1 && /^[a-f0-9]{64}$/.test(argv[0])) messageKey = argv.shift();
   if (command === 'recipient' && argv.length === 1) {
     recipient = argv.shift();
@@ -55,8 +70,14 @@ function parseArgs(argv) {
     qrFile = argv[1]; argv = [];
     if (!path.isAbsolute(qrFile)) throw new Error('QR file must be an absolute path');
   }
-  if (argv.length || (command === 'recipient' && !recipient) || (command === 'reply' && !messageKey) || !['pair', 'run', 'status', 'notify', 'reply', 'enable', 'disable', 'recipient', 'ping', 'help', '--help'].includes(command)) throw new Error('invalid command; use help');
-  return { command, qrFile, recipient, messageKey };
+  if (argv.length || (command === 'recipient' && !recipient) ||
+      (['reply', 'progress', 'reply-file'].includes(command) && !/^[a-f0-9]{64}$/.test(messageKey ?? '')) ||
+      (command === 'progress' && !['picked-up', 'working', 'waiting', 'failed'].includes(progressState)) ||
+      (command === 'reply-file' && !path.isAbsolute(attachmentFile ?? '')) ||
+      (command === 'summary' && !['status', 'pending', 'blocked', 'decisions', 'last result', 'more'].includes(value)) ||
+      (command === 'preferences' && !value) || (command === 'telegram-config' && (!tokenFile || !userId)) ||
+      !['pair', 'run', 'status', 'notify', 'reply', 'progress', 'reply-file', 'summary', 'preferences', 'voice-status', 'telegram-config', 'enable', 'disable', 'recipient', 'ping', 'help', '--help'].includes(command)) throw new Error('invalid command; use help');
+  return { command, qrFile, recipient, messageKey, progressState, attachmentFile, value, tokenFile, userId };
 }
 export function qrSvg(code) {
   const size = code.getModuleCount(), edge = size + 8;
@@ -73,7 +94,7 @@ function writeQr(file, text) {
 }
 async function main(argv) {
   process.umask(0o077);
-  const { command, qrFile, recipient, messageKey } = parseArgs(argv);
+  const { command, qrFile, recipient, messageKey, progressState, attachmentFile, value, tokenFile, userId } = parseArgs(argv);
   if (command === 'help' || command === '--help') { process.stdout.write(help); return; }
   const home = process.env.FM_HOME;
   if (!home || !path.isAbsolute(home)) throw new Error('set FM_HOME to an absolute operational home');
@@ -84,10 +105,16 @@ async function main(argv) {
   if (!path.isAbsolute(firstmateState) || !path.isAbsolute(codeRoot)) throw new Error('Firstmate state and code root must be absolute');
   if (command === 'status') { process.stdout.write(`${JSON.stringify(safeHealth(state))}\n`); return; }
   const store = new Store(home, state);
+  if (command === 'voice-status') { process.stdout.write(`${JSON.stringify(loadVoiceConfig(store))}\n`); return; }
+  if (command === 'telegram-config') {
+    await configureTelegram(store, tokenFile, userId);
+    process.stdout.write('Telegram fallback paired; start the bridge and message the bot from that user.\n'); return;
+  }
   if (command === 'recipient') {
     const unlock = store.lock();
     try {
-      if (store.records('outbox').length || store.records('pending').length) throw new Error('resolve queued messages before changing recipient');
+      if (['outbox', 'pending', 'media-pending', 'telegram-pending'].some(directory =>
+        fs.existsSync(store.file(directory)) && store.records(directory).length)) throw new Error('resolve queued messages before changing recipient');
       writeJson(store.file('recipient.json'), { account: recipient === 'self' ? null : `${recipient.slice(1)}@s.whatsapp.net` });
       process.stdout.write('recipient configured; start the bridge\n');
     } finally { unlock(); }
@@ -104,8 +131,19 @@ async function main(argv) {
     process.stdout.write(`${command === 'enable' ? 'enabled' : 'disabled'}\n`); return;
   }
   const adapter = new FirstmateAdapter({ home, codeRoot, state: firstmateState, store, extensionRoot: root });
+  const tgStore = telegramStore(store);
+  const tgAdapter = new FirstmateAdapter({ home, codeRoot, state: firstmateState, store: tgStore, extensionRoot: root });
+  const requestAdapter = key => readJson(store.file(`handoffs/${key}.json`))?.route?.transport === 'telegram' ? tgAdapter : adapter;
+  const policy = new NotificationPolicy({ stateDir: store.root });
+  const optionalTelegram = () => { try { return telegramConfig(store); } catch { return null; } };
+  if (command === 'summary') { process.stdout.write(`${await adapter.summary(value)}\n`); return; }
+  if (command === 'preferences') {
+    const result = policy.command(value);
+    if (!result.recognized) throw new Error('unknown notification preference');
+    process.stdout.write(`${result.text}\n`); return;
+  }
   const events = () => adapter.events();
-  if (command === 'notify' || command === 'reply') {
+  if (['notify', 'reply', 'progress', 'reply-file'].includes(command)) {
     const chunks = []; let count = 0;
     for await (const chunk of process.stdin) {
       count += chunk.length;
@@ -114,18 +152,31 @@ async function main(argv) {
     }
     const text = Buffer.concat(chunks).toString('utf8').replace(/\r?\n$/, '');
     if (command === 'reply') {
-      process.stdout.write(`queued ${adapter.reply(messageKey, text)}\n`); return;
+      process.stdout.write(`queued ${requestAdapter(messageKey).reply(messageKey, text)}\n`); return;
+    }
+    if (command === 'progress') {
+      requestAdapter(messageKey).progress(messageKey, progressState, text);
+      process.stdout.write(`recorded ${progressState}\n`); return;
+    }
+    if (command === 'reply-file') {
+      const selected = requestAdapter(messageKey);
+      const { receipt } = selected.requestReceipt(messageKey);
+      const attachment = stageAttachment(selected.store, attachmentFile, { requestKey: messageKey });
+      const caption = text || `Report: ${attachment.name}`;
+      const queued = store.enqueue(caption, { kind: 'reply', session: '', route: attachment.route,
+        requestKey: messageKey, attachment, fallbackRoute: receipt.fallbackRoute, id: `attachment:${messageKey}:${attachment.digest}:${caption}` });
+      process.stdout.write(`queued ${queued}\n`); return;
     }
     const current = validateSnapshot(await events());
     if (!current.afk) throw new Error('the delegate must be enabled and Firstmate away; nothing queued');
-    const key = store.enqueue(text, { session: current.session });
+    const key = store.enqueue(text, { session: current.session, route: store.currentRoute(), fallbackRoute: optionalTelegram()?.route });
     process.stdout.write(`queued ${key}\n`); return;
   }
   const release = store.lock();
   let socket, interval, reconnect, done, stopped = false, attempt = 0, qrShown = false;
   let serial = Promise.resolve();
   let pending = 0; let ticking = false;
-  let bridge;
+  let bridge, mediaWork;
   const acknowledgements = new Acknowledgements();
   const finish = new Promise(resolve => { done = resolve; });
   const log = text => process.stderr.write(`fm-whatsapp: ${text}\n`);
@@ -156,9 +207,9 @@ async function main(argv) {
     // libsignal bypasses the configured Baileys logger and can print key material.
     // Our own diagnostics use explicit sanitized process.stderr writes below.
     for (const method of ['log', 'info', 'warn', 'error', 'debug', 'trace']) console[method] = () => {};
-    let makeWASocket, useMultiFileAuthState, DisconnectReason, qr, QRCode, qrLevel;
+    let makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, proto, qr, QRCode, qrLevel;
     try {
-      ({ default: makeWASocket, useMultiFileAuthState, DisconnectReason } = await import('@whiskeysockets/baileys'));
+      ({ default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, proto } = await import('@whiskeysockets/baileys'));
       qr = (await import('qrcode-terminal')).default;
       QRCode = (await import('qrcode-terminal/vendor/QRCode/index.js')).default;
       qrLevel = (await import('qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel.js')).default;
@@ -174,7 +225,11 @@ async function main(argv) {
     bridge = new Bridge({ store, events, peer,
       inbox: (key, text) => adapter.note(key, text),
       status: () => adapter.status(),
-      send: async (jid, text, messageId) => {
+      summary: command => adapter.summary(command),
+      notificationPolicy: policy,
+      localCommand: text => policy.command(text),
+      fallbackRoute: () => optionalTelegram()?.route,
+      send: async (jid, text, messageId, job) => {
         if (!socket || stopped) return false;
         // Resolve the recipient's authenticated PN/LID mapping before sending,
         // so either form of server acknowledgement can be matched exactly.
@@ -184,11 +239,21 @@ async function main(argv) {
         }
         const waiter = acknowledgements.register(messageId, bridge.peer ?? bridge.identity);
         try {
-          const response = await socket.sendMessage(jid, { text }, { messageId });
+          const content = job?.attachment ? outboundContent({ ...job, text }, store) : { text };
+          const response = await socket.sendMessage(jid, content, { messageId });
           if (response?.key?.id !== messageId) throw new Error('unexpected local send identity');
           return await waiter.promise;
         } catch { waiter.cancel(); return false; }
       } });
+    const intake = new MediaIntake({ store, bridge,
+      encode: message => proto.WebMessageInfo.encode(message).finish(),
+      decode: bytes => proto.WebMessageInfo.decode(bytes),
+      download: message => downloadMediaMessage(message, 'stream', { options: { signal: AbortSignal.timeout(30000) } }),
+      transcribe: file => transcribeVoice(file, { store }) });
+    const telegram = new TelegramDelegate({ store, adapter: tgAdapter,
+      notificationAllowed: (job, snapshot, now) => policy.allow(job, snapshot, now),
+      command: async text => { const result = policy.command(text); return result.recognized ? result.text : null; },
+      attachmentReader: job => attachmentBytes(job, store) });
     bridge.disconnect('connecting');
     const silent = { level: 'silent', trace() {}, debug() {}, info() {}, warn() {}, error() {}, fatal() {}, child() { return this; } };
     const connect = () => {
@@ -233,6 +298,7 @@ async function main(argv) {
           }));
           writeJson(store.file('receive-health.json'), { at: epoch(), type: batch.type, messages: diagnostics });
           bridge.stage(batch);
+          intake.stage(batch);
         }
         catch { bridge.problem = 'incoming capture failed; retry message'; bridge.health(); }
         enqueue(() => bridge.processPending());
@@ -241,7 +307,11 @@ async function main(argv) {
         if (socket !== current || stopped) return;
         if (update.connection) currentState = update.connection;
         if (update.qr) {
-          if (command !== 'pair') { stop('pairing required'); return; }
+          if (command !== 'pair') {
+            if (optionalTelegram()) bridge.disconnect('WhatsApp pairing required; Telegram fallback enabled');
+            else stop('pairing required');
+            return;
+          }
           qr.generate(update.qr, { small: true }, rendered => {
             try {
               if (qrFile) {
@@ -284,7 +354,12 @@ async function main(argv) {
           bridge.disconnect('disconnected; reconnect pending');
           const code = update.lastDisconnect?.error?.output?.statusCode;
           if (connectionDisposition(code, DisconnectReason) === 'stop') {
-            log('session is unavailable; stopped without deleting credentials'); stop('login required or connection replaced');
+            if (command === 'run' && optionalTelegram()) {
+              log('WhatsApp requires pairing; optional Telegram remains available');
+              bridge.disconnect('WhatsApp login required; Telegram fallback enabled');
+            } else {
+              log('session is unavailable; stopped without deleting credentials'); stop('login required or connection replaced');
+            }
           } else {
             const delay = reconnectDelay(attempt++);
             clearTimeout(reconnect);
@@ -301,15 +376,25 @@ async function main(argv) {
       const admitted = enqueue(async () => {
         try {
           await bridge.processPending();
-          if (tick++ % 5 === 0) await bridge.refresh();
+          if (tick++ % 5 === 0) {
+            await bridge.refresh();
+            const reports = await adapter.maintain();
+            for (const report of reports) adapter.notifyMaintenance(report);
+            if (optionalTelegram()) for (const report of await tgAdapter.maintain()) tgAdapter.notifyMaintenance(report);
+          }
+          if (!mediaWork) mediaWork = intake.processOne().catch(() => {
+            bridge.problem = 'media processing unavailable; private intake retained';
+          }).finally(() => { mediaWork = null; });
           bridge.health();
           await bridge.flush();
+          await telegram.tick(bridge, bridge.snapshot);
         } finally { ticking = false; }
       });
       if (!admitted) ticking = false;
     }, 3000);
     await finish;
     await serial;
+    await mediaWork;
   } finally {
     stopped = true; clearInterval(interval); clearTimeout(reconnect);
     socket?.end(new Error('local bridge stopped'));

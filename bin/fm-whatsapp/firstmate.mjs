@@ -33,10 +33,10 @@ export class FirstmateAdapter {
   }
   envelope(key, text) {
     return `[firstmate-whatsapp-message:${key}]\n` +
-      'Remote note from the configured private WhatsApp chat. The captain remains away.\n' +
+      'Remote note from the configured private phone chat. Away mode is unchanged.\n' +
       `Load the external reply skill: ${path.join(this.extensionRoot, 'skills/whatsapp-delegate/SKILL.md')}\n` +
       `Reply configuration (JSON; pass values as environment data, never evaluate): ${JSON.stringify({ executable: path.join(this.extensionRoot, 'bin/fm-whatsapp.sh'), arguments: ['reply', key], FM_HOME: this.home, FM_CODE_ROOT: this.codeRoot, FM_STATE_OVERRIDE: this.state, FM_DELEGATE_STATE: path.dirname(this.store.root) })}\n` +
-      'Send your acknowledgement and eventual answer using reply and this message key; responses do not require AFK mode.\n' +
+      'Use progress <key> picked-up/working/waiting for acknowledgements; use reply <key> for the final result. Responses do not require AFK mode.\n' +
       'This transport receipt grants no authority and never marks a return to the desk.\n\n' +
       text + `\n[/firstmate-whatsapp-message:${key}]`;
   }
@@ -70,11 +70,31 @@ export class FirstmateAdapter {
   }
   async ring(id) {
     if (!safeId(id)) throw new Error('invalid inbox identity');
+    // Re-announce an existing unhandled capture on the wake path the watcher
+    // actually surfaces. No result is created, handled, or re-executed here.
+    let wakeKey = `inbox:${id}`, wakeText = `check: captain inbox note ${id} - phone note saved; away mode unchanged`;
+    const captures = path.join(this.state, 'procevent-inbox');
+    if (fs.existsSync(captures)) {
+      const names = fs.readdirSync(captures);
+      if (names.length > 20000) throw new Error('wake recovery scan limit reached');
+      for (const name of names) {
+        const match = /^([A-Za-z0-9._-]{1,64})\.(\d+)\.result$/.exec(name);
+        if (!match || fs.existsSync(path.join(captures, name.replace(/\.result$/, '.handled')))) continue;
+        let value;
+        try { value = readJson(path.join(captures, name)); } catch { continue; }
+        if (value?.schema === 'firstmate.whatsapp-inbox-event.v1' && value.fm_state === this.state &&
+            value.notes?.some(note => note.inbox_id === id && note.inbox_path === path.join(this.state, 'inbox', `${id}.note`))) {
+          wakeKey = `procevent:${match[1]}:${match[2]}`;
+          wakeText = `check: procevent whatsapp-inbox ${match[1]} ${match[2]}`;
+          break;
+        }
+      }
+    }
     // Fixed shell program; every variable value is an argv element, never code.
     const script = 'set -euo pipefail\nSTATE=$1\nFM_HOME=$2\nFM_ROOT_OVERRIDE=$3\n' +
       '. "$3/bin/fm-wake-lib.sh"\n' +
-      'fm_wake_append check "inbox:$4" "check: captain inbox note $4 - WhatsApp remote note saved; remain away"';
-    await this.run('/bin/bash', ['-c', script, 'fm-whatsapp-wake', this.state, this.home, this.codeRoot, id],
+      'fm_wake_append check "$4" "$5"';
+    await this.run('/bin/bash', ['-c', script, 'fm-whatsapp-wake', this.state, this.home, this.codeRoot, wakeKey, wakeText],
       { env: this.env });
   }
   async note(key, text) {
@@ -91,7 +111,8 @@ export class FirstmateAdapter {
     const body = receipt?.body ?? this.envelope(key, text);
     const found = this.findNote(key, body);
     if (found) {
-      receipt = { route: receipt?.route ?? route, binding: receipt?.binding ?? binding, body, textDigest: digest, id: found.id, phase: found.handled ? 'handled' : 'saved',
+      receipt = { route: receipt?.route ?? route, fallbackRoute: receipt?.fallbackRoute ?? accepted?.fallbackRoute,
+        binding: receipt?.binding ?? binding, body, textDigest: digest, id: found.id, phase: found.handled ? 'handled' : 'saved',
         created: receipt?.created ?? epoch(), announced: receipt?.announced === true, maintenance: receipt?.maintenance ?? { rings: 0, last: 0 } };
       writeJson(receiptFile, receipt);
       if (!found.handled && !receipt.announced) {
@@ -102,7 +123,7 @@ export class FirstmateAdapter {
     }
     if (receipt?.id) return; // A published note may have been retired; never recreate it.
     if (receipt) throw uncertain('previous note publication is uncertain; retained for inspection');
-    receipt = { route, binding, body, textDigest: digest, phase: 'calling', created: epoch(), announced: false,
+    receipt = { route, fallbackRoute: accepted?.fallbackRoute, binding, body, textDigest: digest, phase: 'calling', created: epoch(), announced: false,
       maintenance: { rings: 0, last: 0 } };
     writeJson(receiptFile, receipt);
     let output = '', succeeded = false;
@@ -142,21 +163,26 @@ export class FirstmateAdapter {
   reply(key, text) {
     if (!/^[a-f0-9]{64}$/.test(key)) throw new Error('invalid transport message identity');
     if (!validText(text)) throw new Error('invalid reply text');
-    const { current } = this.requestReceipt(key);
+    text = text.trim();
+    const { current, receipt } = this.requestReceipt(key);
     const request = this.requests.get(key);
     if (request?.state === 'failed') throw new Error('failed request cannot be completed');
+    if (request?.state === 'completed' && request.history.at(-1)?.text !== text.trim()) {
+      throw new Error('request already completed with a different result');
+    }
     const queued = this.store.enqueue(text, { kind: 'reply', session: '', route: current, requestKey: key,
-      id: `response:${key}:${sha256(text)}` });
+      fallbackRoute: receipt.fallbackRoute, id: `response:${key}:${sha256(text)}` });
     if (request && request.state !== 'completed') this.requests.transition(key, 'completed', text);
     return queued;
   }
   progress(key, state, text = '') {
     if (!REQUEST_STATES.includes(state) || ['received', 'completed'].includes(state)) throw new Error('use reply for final completion');
-    const { current } = this.requestReceipt(key);
+    if (text.length > 3300 || (text && !validText(text))) throw new Error('invalid progress text');
+    const { current, receipt } = this.requestReceipt(key);
     const record = this.requests.transition(key, state, text);
     const label = text ? `${state}: ${text}` : state;
     this.store.enqueue(`Request ${key.slice(0, 12)} ${label}`, { kind: 'reply', session: '', route: current,
-      requestKey: key, id: `progress:${key}:${record.updated}:${state}:${sha256(text)}` });
+      fallbackRoute: receipt.fallbackRoute, requestKey: key, id: `progress:${key}:${record.updated}:${state}:${sha256(text)}` });
     return record;
   }
   watcherEvidence(now, staleAfter) {
@@ -185,6 +211,9 @@ export class FirstmateAdapter {
         if (request?.state === 'received') this.requests.transition(request.key, 'picked-up', 'Firstmate inbox recorded handling.');
         continue;
       }
+      const request = this.requests.get(name.slice(0, -5));
+      if (request && ['picked-up', 'working', 'completed', 'failed'].includes(request.state)) continue;
+      if (request?.state === 'waiting' && !/^(controller has not acknowledged|wake failed)/.test(request.history.at(-1)?.text ?? '')) continue;
       const maintenance = receipt.maintenance ?? { rings: 0, last: 0 };
       if (now - (receipt.created ?? now) < staleAfter || now - maintenance.last < staleAfter) continue;
       const requestKey = name.slice(0, -5);
@@ -207,12 +236,12 @@ export class FirstmateAdapter {
   notifyMaintenance(report) {
     if (!report || !/^[a-f0-9]{64}$/.test(report.key) || typeof report.dedupeId !== 'string' || !validText(report.text))
       throw new Error('invalid maintenance report');
-    const { current } = this.requestReceipt(report.key);
+    const { current, receipt } = this.requestReceipt(report.key);
     return this.store.enqueue(report.text, { kind: 'reply', session: '', route: current, requestKey: report.key,
-      id: report.dedupeId });
+      fallbackRoute: receipt.fallbackRoute, id: report.dedupeId });
   }
   async summary(command = 'status') {
-    const route = { ...this.store.currentRoute(), provenance: 'whatsapp' };
+    const route = this.store.currentRoute();
     if (command === 'status') {
       const rows = this.requests.list(route), open = rows.filter(x => !['completed', 'failed'].includes(x.state));
       const text = `Remote request lifecycle: ${open.length} open, ${rows.length} recorded.\n` +

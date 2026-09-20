@@ -40,6 +40,8 @@ function write(file, value) {
   try { fs.writeFileSync(fd, `${JSON.stringify(value)}\n`); fs.fsyncSync(fd); }
   finally { fs.closeSync(fd); }
   fs.renameSync(temporary, file);
+  const directory = fs.openSync(path.dirname(file), 'r');
+  try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
 }
 function validZone(zone) {
   try { new Intl.DateTimeFormat('en-GB', { timeZone: zone }).format(); return true; }
@@ -99,6 +101,7 @@ export class NotificationPolicy {
     const preferences = this.preferences();
     if (!preferences.enabled || !snapshot?.afk || !snapshot.session || job?.session !== snapshot.session ||
         this.quiet(now, preferences)) return false;
+    if (job.automatic === false) return true;
     const events = job?.sourceEvents ?? (job?.kind && job?.task !== undefined ? [job] : []);
     const active = new Set((snapshot.events ?? []).map(event => event.id));
     return events.length > 0 && events.every(event => eventValid(event) && preferences.kinds[event.kind] &&
@@ -175,6 +178,11 @@ export class NotificationPolicy {
       ids = []; events = []; text = prefix;
     };
     for (const [id, pending] of entries) {
+      // Decisions expire independently and must retain exact quote context.
+      // Keep each on its own delivery even when its digest timer delayed it.
+      if (pending.event.kind === 'decision') {
+        flush(); pages.push(this.delivery([id], [pending.event], session)); continue;
+      }
       const addition = `${events.length ? '\n' : ''}• ${pending.event.text}`;
       if (prefix.length + 2 + pending.event.text.length > 3500) {
         // Preserve the whole source as a standalone delivery when digest markup

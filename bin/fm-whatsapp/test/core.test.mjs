@@ -114,7 +114,7 @@ test('status is read-only and text notes use hashed account/message identity wit
   assert.equal(f.calls.inbox.length, 1);
   assert.equal(f.calls.inbox[0].key, sha256(`${identity.account}\nNOTE`));
   assert.ok(f.calls.inbox[0].text.endsWith(text));
-  assert.match(f.calls.inbox[0].text, /remain away/);
+  assert.match(f.calls.inbox[0].text, /away mode unchanged/);
   await f.bridge.receive(batch(message('normal text', { id: 'NORMAL' }), message('!fm exec rm', { id: 'EXEC' })));
   assert.equal(f.calls.inbox.length, 3);
   assert.ok(f.calls.inbox.some(note => note.text.endsWith('normal text')));

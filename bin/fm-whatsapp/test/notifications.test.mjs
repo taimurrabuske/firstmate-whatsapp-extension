@@ -73,11 +73,11 @@ test('digest capture survives restart and retries until explicit commit', t => {
   const restarted = new NotificationPolicy(root);
   assert.deepEqual(restarted.plan(snapshot([event('x'), event('d', 'decision')]), 4609), []);
   const first = restarted.plan(snapshot([event('x'), event('d', 'decision')]), 4610);
-  assert.equal(first.length, 1); assert.equal(first[0].kind, 'digest');
-  assert.deepEqual(new Set(first[0].sourceIds), new Set(['x', 'd']));
+  assert.equal(first.length, 2); assert.equal(first[0].kind, 'digest');
+  assert.deepEqual(new Set(first.flatMap(page => page.sourceIds)), new Set(['x', 'd']));
   const retry = new NotificationPolicy(root).plan(snapshot([event('x'), event('d', 'decision')]), 4700);
   assert.equal(retry[0].id, first[0].id);
-  restarted.commit(first[0]);
+  for (const page of first) restarted.commit(page);
   assert.deepEqual(new NotificationPolicy(root).plan(snapshot([event('x'), event('d', 'decision')]), 4800), []);
 });
 

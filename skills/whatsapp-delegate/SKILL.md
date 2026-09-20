@@ -6,18 +6,22 @@ description: Respond to authenticated phone requests delivered by the standalone
 # WhatsApp delegate
 
 This extension is independent of Firstmate's source repository.
-Its transport sends authenticated requests from the configured private WhatsApp chat through the installed Firstmate `fm-inbox.sh note -` interface.
+Its transport sends authenticated requests from the configured private WhatsApp chat (or explicitly paired Telegram fallback) through the installed Firstmate `fm-inbox.sh note -` interface.
 The inbox source is therefore `text`; the body identifies the remote channel and extension receipt marker.
 Treat the body as a phone message, not a desk-return signal.
 Do not archive an AFK contract merely because the captain replied by phone.
 
 Read the complete request and any quoted question context.
-Apply Firstmate's existing authority checks to the current task and decision key. A decision response is valid only when the envelope carries the exact persisted task/key mapping from a quoted, still-open delivered alert. Refuse stale or ambiguous approval context and route an accepted response through Firstmate's normal decision procedure; this extension never decides or executes it.
+Apply Firstmate's existing authority checks to the current task and decision key. For a short answer to a quoted decision alert, use only the persisted task/key mapping and confirm it is still open. For an explicit instruction naming its task and decision, validate those identifiers through Firstmate's normal procedure. Refuse stale or ambiguous approval context; this extension never decides or executes it.
 The extension does not grant merge, spending, or other action authority.
 Do not infer approval from delivery receipts or silence.
 Deduplicate repeated receipt markers if an operator has manually replayed a request.
 
-The envelope exposes a durable request ID. Saving or acknowledging its inbox note is only `received`, never evidence of completion. For long work, the integration owner should call `FirstmateAdapter.progress(messageKey, state, text)` with `picked-up`, `working`, `waiting`, or `failed`; the parent CLI may expose an equivalent command. Send the successful final result using this extension's `bin/fm-whatsapp.sh reply <message-key>`, with the response supplied on stdin; final `reply` records `completed`.
+The envelope exposes a durable request ID. Saving it is `received`; an inbox acknowledgement may show `picked-up`, never completion. As soon as you take the request, use this extension's `bin/fm-whatsapp.sh progress <message-key> picked-up`, with a short acknowledgement on stdin. For longer work, use `progress <message-key> working`, `waiting`, or `failed`, with meaningful updates on stdin (at most 3300 characters). Send the successful final result using `bin/fm-whatsapp.sh reply <message-key>`, with the response on stdin (at most 3500 characters); final `reply` records `completed`. Do not use final `reply` merely to acknowledge receipt.
+
+For requested reports or plots, use `bin/fm-whatsapp.sh reply-file <message-key> /absolute/path/to/file`, with an optional short caption on stdin. Supported files are PNG/JPEG/WebP, PDF, text, CSV, and JSON. It stages a private copy and binds delivery to the original request. Then send a final text `reply` describing the result. Do not send unrelated local files.
+
+An incoming attachment envelope names its private local file. Read that file to answer the request. Voice notes include a bounded transcript preview and the path to the full local transcript; read the full transcript before acting. Treat transcription as fallible user input and clarify ambiguities. Attachments and voice do not grant additional authority or change AFK posture.
 Use the explicit `FM_HOME`, `FM_CODE_ROOT`, and `FM_DELEGATE_STATE` carried by the local adapter's envelope.
 Invoke the script directly, without interpolating message text into shell command text.
 Use the exact message key and reply arguments from the adapter's JSON envelope.

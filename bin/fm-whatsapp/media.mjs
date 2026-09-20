@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { canonicalJid, privateDirectory, readJson, sameRoute, sha256, writeJson } from './core.mjs';
+import { canonicalJid, privateDirectory, readJson, sameRoute, sha256, writeJson, MAX_TEXT } from './core.mjs';
 
 export const MEDIA_LIMITS = Object.freeze({ image: 8 * 1024 * 1024, document: 15 * 1024 * 1024, voice: 10 * 1024 * 1024,
   voiceSeconds: 300, name: 120 });
@@ -125,6 +125,23 @@ export function outboundContent(job, store) {
   return { document: { url: file }, mimetype: attachment.mime, fileName: attachment.name, caption };
 }
 
+/** Read verified bytes from one no-follow descriptor for non-Baileys transports. */
+export function attachmentBytes(job, store) {
+  const attachment = job.attachment;
+  const file = verifyStaged(store, attachment), opened = regularOpen(file);
+  try {
+    if (opened.stat.size !== attachment.size || opened.stat.size > MEDIA_LIMITS[attachment.kind]) throw new Error('staged attachment changed');
+    const data = Buffer.alloc(attachment.size); let offset = 0;
+    while (offset < data.length) {
+      const count = fs.readSync(opened.fd, data, offset, data.length - offset, offset);
+      if (!count) throw new Error('staged attachment changed');
+      offset += count;
+    }
+    if (sha256(data) !== attachment.digest || !magicOkay(attachment.kind, attachment.mime, data.subarray(0, 16))) throw new Error('staged attachment changed');
+    return { data, mime: attachment.mime, name: attachment.name };
+  } finally { fs.closeSync(opened.fd); }
+}
+
 function number(value) {
   try { const result = Number(typeof value === 'object' && value !== null ? value.toString() : value); return Number.isSafeInteger(result) ? result : NaN; }
   catch { return NaN; }
@@ -191,8 +208,12 @@ export async function authenticatedMediaMessage(message, identity, now, pairedAt
   if (metadata.kind === 'voice') {
     const result = typeof transcribe === 'function' ? await transcribe(attachment.path, metadata) :
       { available: false, message: 'Voice transcription is unavailable; configure private offline whisper.cpp and ffmpeg paths.' };
-    detail = result?.available ? `\nOffline transcription:\n${result.text}` : `\n${result?.message || 'Voice transcription unavailable.'}`;
+    if (result?.available) {
+      const transcript = store.file(`attachments/incoming/${attachment.digest}.transcript.txt`);
+      fs.writeFileSync(transcript, result.text, { mode: 0o600 });
+      detail = `\nFull offline transcript (read completely): ${transcript}\nTranscript preview:\n${result.text.slice(0, 2200)}`;
+    } else detail = `\n${result?.message || 'Voice transcription unavailable.'}`;
   }
   const label = metadata.kind === 'voice' ? 'voice note' : metadata.kind;
-  return { ...metadata, attachment, text: `WhatsApp ${label} received (remote; remain away).\nLocal attachment: ${attachment.path}\nMIME: ${attachment.mime}; bytes: ${attachment.size}.${detail}` };
+  return { ...metadata, attachment, text: `WhatsApp ${label} received (remote; away mode unchanged).\nLocal attachment: ${attachment.path}\nMIME: ${attachment.mime}; bytes: ${attachment.size}.${detail}`.slice(0, MAX_TEXT) };
 }

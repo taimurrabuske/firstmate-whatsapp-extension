@@ -68,7 +68,8 @@ test('saved-but-unannounced recovery only re-rings through the existing wake own
   await adapter.note(key, 'exact text');
   assert.equal(calls.length, 2);
   assert.equal(calls[1].file, '/bin/bash'); assert.equal(calls[1].args[0], '-c');
-  assert.equal(calls[1].args.at(-1), '1000-abcdef');
+  assert.equal(calls[1].args.at(-2), 'inbox:1000-abcdef');
+  assert.match(calls[1].args.at(-1), /captain inbox note 1000-abcdef/);
   assert.ok(!calls[1].args[1].includes(f.home)); // Caller values are argv, never interpolated code.
   assert.equal(readJson(f.store.file(`handoffs/${key}.json`)).announced, true);
   await adapter.note(key, 'exact text'); assert.equal(calls.length, 2);
@@ -121,6 +122,8 @@ test('explicit progress is durable, transition-checked, and reply is the only fi
   assert.equal(adapter.progress(key, 'picked-up', 'Owner explicitly resumed it.').state, 'picked-up');
   adapter.reply(key, 'Checks passed.');
   assert.equal(adapter.requests.get(key).state, 'completed');
+  adapter.reply(key, 'Checks passed.');
+  assert.throws(() => adapter.reply(key, 'Checks failed.'), /already completed/);
   assert.throws(() => adapter.progress(key, 'waiting'), /invalid request transition/);
   assert.equal(f.store.records('outbox').length, 3);
 });
@@ -131,7 +134,8 @@ test('maintenance only re-rings an existing stale note with a strict bound and r
   const adapter = new FirstmateAdapter({ ...f.options, run: async (file, args) => { calls.push({ file, args }); return ''; } });
   adapter.requests.receive(key, { route, text: 'do not duplicate' });
   const body = adapter.envelope(key, 'do not duplicate'); saveNote(f, body, 'note-1');
-  writeJson(f.store.file(`handoffs/${key}.json`), { id: 'note-1', body, phase: 'saved', route, created: 1,
+  const fallbackRoute = { transport: 'telegram', account: 'telegram:bot', recipient: 'telegram:user', credentialDigest: 'digest' };
+  writeJson(f.store.file(`handoffs/${key}.json`), { id: 'note-1', body, phase: 'saved', route, fallbackRoute, created: 1,
     binding: { home: fs.realpathSync(f.home), codeRoot: path.resolve(f.options.codeRoot), state: path.resolve(f.options.state) },
     maintenance: { rings: 0, last: 0 } });
   const foreignKey = 'f'.repeat(64);
@@ -145,6 +149,7 @@ test('maintenance only re-rings an existing stale note with a strict bound and r
   assert.match(report[0].dedupeId, /^maintenance:/);
   adapter.notifyMaintenance(report[0]); adapter.notifyMaintenance(report[0]);
   assert.equal(f.store.records('outbox').length, 1);
+  assert.deepEqual(readJson(f.store.file(`outbox/${f.store.records('outbox')[0]}`)).fallbackRoute, fallbackRoute);
   fs.mkdirSync(path.join(f.home, 'state/inbox/handled'));
   fs.renameSync(path.join(f.home, 'state/inbox/note-1.note'), path.join(f.home, 'state/inbox/handled/note-1.note'));
   await adapter.maintain({ now: 3000, staleAfter: 10, maxRings: 1 });

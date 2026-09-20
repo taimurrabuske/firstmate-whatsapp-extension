@@ -5,7 +5,7 @@ import { privateDirectory, readJson, writeJson, sameRoute, validText } from './c
 
 export const REQUEST_STATES = ['received', 'picked-up', 'working', 'waiting', 'completed', 'failed'];
 const transitions = {
-  received: new Set(['picked-up', 'working', 'waiting', 'failed']),
+  received: new Set(['picked-up', 'working', 'waiting', 'completed', 'failed']),
   'picked-up': new Set(['working', 'waiting', 'completed', 'failed']),
   working: new Set(['picked-up', 'waiting', 'completed', 'failed']),
   waiting: new Set(['picked-up', 'working', 'completed', 'failed']),
@@ -15,9 +15,10 @@ const validKey = key => typeof key === 'string' && /^[a-f0-9]{64}$/.test(key);
 const clean = text => text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '').trim();
 const excerpt = (text, limit) => text.length <= limit ? text : `${text.slice(0, Math.floor(limit * 0.7))} … ${text.slice(-(limit - Math.floor(limit * 0.7) - 3))}`;
 const MAX_PAGE = 3300;
-const routeScope = (route, provenance = route?.provenance ?? 'whatsapp') => crypto.createHash('sha256').update(JSON.stringify({
+const routeScope = (route, provenance = route?.transport ?? route?.provenance ?? 'whatsapp') => crypto.createHash('sha256').update(JSON.stringify({
   provenance,
-  credential: route?.credentialFingerprint ?? route?.account,
+  account: route?.account,
+  credential: route?.credentialDigest ?? route?.credentialFingerprint ?? route?.account,
   recipient: route?.recipient
 })).digest('hex');
 
@@ -52,8 +53,8 @@ export class RequestJournal {
     if (!REQUEST_STATES.includes(state) || (text && !validText(text))) throw new Error('invalid request progress');
     const file = this.file(key), record = readJson(file);
     if (!record) throw new Error('unknown request identity');
-    if (record.state === state) return record;
-    if (!transitions[record.state]?.has(state)) throw new Error(`invalid request transition from ${record.state}`);
+    if (record.state === state && (!text || record.history.at(-1)?.text === clean(text))) return record;
+    if (record.state !== state && !transitions[record.state]?.has(state)) throw new Error(`invalid request transition from ${record.state}`);
     const now = this.clock(); record.state = state; record.updated = now;
     record.history = [...record.history, { state, at: now, ...(text ? { text: clean(text) } : {}) }].slice(-32);
     writeJson(file, record); return record;
