@@ -15,13 +15,21 @@ Supported outgoing types are JPEG, PNG, WebP, PDF, plain text, CSV, and JSON. In
 
 ## Offline voice configuration
 
-`bin/fm-whatsapp/voice.mjs` exports `loadVoiceConfig(store)`, `transcribeVoice(input, options)`, and `runProgram`. Create `whatsapp/voice.json` in the extension's private delegate state (mode 600):
+`bin/fm-whatsapp/voice.mjs` exports `loadVoiceConfig(store)`, `transcribeVoice(input, options)`, `runProgram`, and `validateVoicePaths(paths)`. Configure it from the operator terminal without editing state by hand:
+
+```bash
+./bin/fm-whatsapp.sh voice-config set /absolute/path/to/ffmpeg /absolute/path/to/whisper-cli /absolute/private/path/to/ggml-model.bin [LANG]
+./bin/fm-whatsapp.sh voice-config inspect
+./bin/fm-whatsapp.sh voice-config remove
+```
+
+`set` validates every argument (absolute, regular, non-symlink; executables need an execute bit; language defaults to `en`) before atomically writing the private mode-600 `whatsapp/voice.json` under the state root. `inspect` prints the validated setup as JSON; `remove` clears it and is idempotent. Configuration changes apply to voice notes processed afterwards. Hand-written private `voice.json` files remain supported:
 
 ```json
 {"schema":"fm-whatsapp-voice.v1","ffmpeg":"/absolute/path/to/ffmpeg","whisper":"/absolute/path/to/whisper-cli","model":"/absolute/private/path/to/ggml-model.bin","language":"en"}
 ```
 
-All three paths must be absolute local regular files; executables must have an execute bit, and symlinks are rejected. Install `ffmpeg`, build the free `whisper.cpp` `whisper-cli`, and download a compatible local model separately. No model API or paid gateway is used. Configuration is read only from private local state, not incoming text.
+All three paths must be absolute local regular files; executables must have an execute bit, and symlinks are rejected. Install `ffmpeg` and build the free `whisper.cpp` `whisper-cli` separately. No model is ever downloaded, and no model API or paid gateway is used. Configuration is read only from private local state, not incoming text; the configured paths are operator arguments and are never echoed into phone chat, logs, or doctor output.
 
 `transcribeVoice` invokes both programs with `execFile` argument arrays (no shell), decodes mono 16 kHz audio capped at thirty minutes, bounds each subprocess's runtime (five minutes for ffmpeg decode, thirty minutes for whisper.cpp) and captured output, bounds decoded WAV and transcript size, and removes its private temporary directory in `finally`. It returns `{available:true,text}` or an intelligible `{available:false,message}`; command stderr and local secrets are not exposed. The original bounded private voice attachment remains available when transcription fails.
 
@@ -37,4 +45,8 @@ const accepted = await authenticatedMediaMessage(message, identity, now, pairedA
 
 The caller remains responsible for durable deduplication before handoff, queueing the staged attachment with the authenticated reply route, and using its normal server-acknowledged send flow. Media acceptance does not change AFK state, approve work, or bypass Firstmate task/merge/spend gates.
 
-Long voice transcripts remain in a private `.transcript.txt` file; when transcription succeeds, the inbox envelope presents the bounded preview explicitly as the user's authenticated instruction, with the full-transcript path first and delimited `Bounded transcript preview (start)`/`(end)` lines. The controller reads the full file. Failed transcription stays an explicit non-command result: the envelope carries only the failure message and the retained private attachment, never a transcript. Captions and media metadata are never treated as instructions. Use `voice-status` to inspect configuration. An installation can use the local English `base.en` model; no voice data is sent to a transcription service.
+Long voice transcripts remain in a private `.transcript.txt` file; when transcription succeeds, the inbox envelope presents the bounded preview explicitly as the user's authenticated instruction, with the full-transcript path first and delimited `Bounded transcript preview (start)`/`(end)` lines. The controller reads the full file. Failed transcription stays an explicit non-command result: the envelope carries only the failure message and the retained private attachment, never a transcript. Captions and media metadata are never treated as instructions. Use `voice-status` to inspect configuration. An installation can use a local English `base.en` model; no voice data is sent to a transcription service.
+
+### Reusing an installed Vocalinux model directory
+
+An installed Vocalinux dictation app keeps standard ggml Whisper weights on disk (for example `~/.local/share/vocalinux/models/whispercpp/ggml-*.bin`) and those regular files are directly usable as the `voice-config set` model path. Local evidence from the installed package: its whisper.cpp runtime is embedded as `libwhisper.so` plus the `pywhispercpp` CPython extension inside its private virtualenv, its main process owns no listening TCP or unix socket (the only `LISTEN` socket in the family is its ibus helper's private text-injection socket), and its only DBus use is a session-bus availability probe. It therefore exposes no stable local daemon/socket/API for submitting audio to its RAM-resident model, and no adapter is built against its internals. Reusing a model file still loads a separate copy per transcription process, so RAM is not shared with the running app. Never stop, restart, or reconfigure that app from this extension; its keep-alive, models, and settings remain operator-owned. The standalone whisper.cpp fallback remains fully supported.

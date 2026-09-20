@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Store, writeJson } from '../core.mjs';
-import { loadVoiceConfig, transcribeVoice, VOICE_CONFIG_SCHEMA, VOICE_LIMITS } from '../voice.mjs';
+import { loadVoiceConfig, transcribeVoice, validateVoicePaths, VOICE_CONFIG_SCHEMA, VOICE_LIMITS } from '../voice.mjs';
 
 function fixture(t) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'fm-voice-test-'));
@@ -16,6 +16,24 @@ function fixture(t) {
   const input = path.join(home, 'voice.ogg'); fs.writeFileSync(input, 'OggSvoice', { mode: 0o600 });
   return { home, store, ffmpeg, whisper, model, input };
 }
+
+test('validateVoicePaths accepts only absolute regular local files and normalizes language', t => {
+  const f = fixture(t);
+  const resolved = validateVoicePaths({ ffmpeg: f.ffmpeg, whisper: f.whisper, model: f.model });
+  assert.deepEqual(resolved, { ffmpeg: fs.realpathSync(f.ffmpeg), whisper: fs.realpathSync(f.whisper),
+    model: fs.realpathSync(f.model), language: 'en' });
+  assert.equal(validateVoicePaths({ ffmpeg: f.ffmpeg, whisper: f.whisper, model: f.model, language: 'de' }).language, 'de');
+  const link = path.join(f.home, 'linked-whisper'); fs.symlinkSync(f.whisper, link);
+  for (const bad of [
+    { ffmpeg: 'ffmpeg', whisper: f.whisper, model: f.model },
+    { ffmpeg: f.ffmpeg, whisper: link, model: f.model },
+    { ffmpeg: f.ffmpeg, whisper: f.whisper, model: path.join(f.home, 'absent.bin') },
+    { ffmpeg: f.ffmpeg, whisper: f.whisper, model: f.model, language: 'EN' },
+    { ffmpeg: f.ffmpeg, whisper: f.whisper, model: f.model, language: 'en-us' }
+  ]) assert.throws(() => validateVoicePaths(bad), /voice /);
+  const noexec = path.join(f.home, 'noexec'); fs.writeFileSync(noexec, '#!/bin/false\n', { mode: 0o600 });
+  assert.throws(() => validateVoicePaths({ ffmpeg: noexec, whisper: f.whisper, model: f.model }), /ffmpeg must be an absolute local regular executable/);
+});
 
 test('voice config requires private absolute local executables and model', t => {
   const f = fixture(t);

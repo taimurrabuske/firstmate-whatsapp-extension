@@ -139,6 +139,28 @@ test('invalid recipient configuration fails before the bridge starts', t => {
   assert.match(result.lines.join('\n'), /recipient configuration is invalid/);
 });
 
+test('doctor reports the optional voice configuration without echoing its paths', t => {
+  const { fx, store } = paired(t);
+  let result = fx.report();
+  assert.equal(result.ready, true);
+  assert.match(result.lines.join('\n'), /voice transcription is not configured/);
+  const bin = name => { const file = path.join(fx.base, name); fs.writeFileSync(file, '#!/bin/false\n', { mode: 0o700 }); return file; };
+  writeJson(store.file('voice.json'), { schema: 'fm-whatsapp-voice.v1', ffmpeg: bin('ffmpeg'), whisper: bin('whisper-cli'), model: bin('model'), language: 'en' });
+  result = fx.report();
+  assert.equal(result.ready, true, result.lines.join('\n'));
+  assert.match(result.lines.join('\n'), /voice transcription configuration validates/);
+  writeJson(store.file('voice.json'), { schema: 'fm-whatsapp-voice.v1', ffmpeg: 'relative', whisper: bin('whisper-cli'), model: bin('model') });
+  result = fx.report();
+  assert.equal(result.ready, false);
+  const line = result.lines.find(line => line.includes('voice.json is not a valid'));
+  assert.ok(line);
+  assert.ok(!line.includes('relative'));
+  fs.chmodSync(store.file('voice.json'), 0o644);
+  result = fx.report();
+  assert.equal(result.ready, false);
+  assert.match(result.lines.join('\n'), /voice\.json is mode 644/);
+});
+
 test('missing runtime dependencies and Firstmate scripts are blocking findings with fixes', t => {
   const { report, base } = fixture(t);
   let result = report({ probes: { nodeMajor: 18 } });

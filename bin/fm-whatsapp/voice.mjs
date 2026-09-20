@@ -21,6 +21,16 @@ function safeRegular(file, executable = false) {
   } catch { return false; }
 }
 
+/** Validate operator-supplied local paths and return the resolved transcription setup. */
+export function validateVoicePaths({ ffmpeg, whisper, model, language = 'en' } = {}) {
+  for (const [field, file, executable] of [['ffmpeg', ffmpeg, true], ['whisper', whisper, true], ['model', model, false]]) {
+    if (!safeRegular(file, executable))
+      throw new Error(`voice ${field} must be an absolute local regular ${executable ? 'executable' : 'file'}; symlinks are rejected`);
+  }
+  if (typeof language !== 'string' || !/^[a-z]{2,8}$/.test(language)) throw new Error('voice language must be a lowercase 2-8 letter code');
+  return { ffmpeg: fs.realpathSync(ffmpeg), whisper: fs.realpathSync(whisper), model: fs.realpathSync(model), language };
+}
+
 /** Read whatsapp/voice.json. Config is private state, never environment or message text. */
 export function loadVoiceConfig(store) {
   const file = store.file('voice.json');
@@ -30,15 +40,17 @@ export function loadVoiceConfig(store) {
     if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) throw new Error('unsafe voice config');
     config = readJson(file);
   } catch (error) {
-    if (error.code === 'ENOENT') return { available: false, message: 'Voice transcription is unavailable; create private whatsapp/voice.json (see docs/media.md).' };
+    if (error.code === 'ENOENT') return { available: false, message: 'Voice transcription is unavailable; run voice-config set or create private whatsapp/voice.json (see docs/media.md).' };
     return { available: false, message: 'Voice transcription setup is invalid; voice.json must be a private mode-600 regular file.' };
   }
-  if (config.schema !== VOICE_CONFIG_SCHEMA || !safeRegular(config.ffmpeg, true) || !safeRegular(config.whisper, true) ||
-      !safeRegular(config.model, false)) {
+  if (config.schema !== VOICE_CONFIG_SCHEMA) {
+    return { available: false, message: 'Voice transcription setup is invalid; voice.json schema is not recognized; run voice-config set again.' };
+  }
+  try {
+    return { available: true, ...validateVoicePaths(config) };
+  } catch {
     return { available: false, message: 'Voice transcription setup is invalid; check absolute ffmpeg, whisper.cpp, and model paths.' };
   }
-  return { available: true, ffmpeg: fs.realpathSync(config.ffmpeg), whisper: fs.realpathSync(config.whisper),
-    model: fs.realpathSync(config.model), language: typeof config.language === 'string' && /^[a-z]{2,8}$/.test(config.language) ? config.language : 'en' };
 }
 
 export function runProgram(file, args, { timeout = 60_000, maxBuffer = 128 * 1024 } = {}) {

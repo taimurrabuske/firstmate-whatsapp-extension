@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { FirstmateAdapter } from './firstmate.mjs';
 import { NotificationPolicy } from './notifications.mjs';
 import { stageAttachment, outboundContent, attachmentBytes } from './media.mjs';
-import { loadVoiceConfig, transcribeVoice } from './voice.mjs';
+import { loadVoiceConfig, transcribeVoice, validateVoicePaths, VOICE_CONFIG_SCHEMA } from './voice.mjs';
 import { MediaIntake } from './media-intake.mjs';
 import { TelegramDelegate, telegramStore, telegramConfig, telegramConfigured, configureTelegram } from './telegram.mjs';
 import { Acknowledgements, Bridge, Store, readJson, writeJson, delegateState, verifyHomeBinding, ownIdentity, canonicalJid, authenticatedMessage, validText, parseRequest, epoch, MAX_TEXT, validateSnapshot } from './core.mjs';
@@ -24,6 +24,8 @@ const help = `Usage: FM_HOME=/absolute/home bin/fm-whatsapp.sh <command>
   summary <shortcut>            Read status, pending, blocked, decisions, last result, or more.
   preferences <command>         Set alerts, subscriptions, quiet hours, or digest interval.
   voice-status                  Check the local offline transcription setup.
+  voice-config set|inspect|remove
+                                Configure local ffmpeg, whisper.cpp, model, and language paths (see help below).
   telegram-config <file> <id>    Pair optional fallback using a private token file and exact user ID.
   notify                         Queue stdin text for the enabled delegate's current AFK session.
   enable                         Opt in to alerts while Firstmate is away (requires live bridge).
@@ -37,6 +39,9 @@ FM_STATE_OVERRIDE selects Firstmate state only, never bridge credentials.
 Bridge records use FM_DELEGATE_STATE or XDG_STATE_HOME/firstmate-whatsapp/<home-hash>/whatsapp.
 Without XDG_STATE_HOME, ~/.local/state is used. State is bound to canonical FM_HOME.
 Only the configured recipient's private conversation is accepted; default is Message Yourself.
+Offline voice transcription: voice-config set FFMPEG WHISPER MODEL [LANGUAGE] accepts absolute local
+paths, validates executables and the model file, and writes private mode-600 state. voice-config inspect
+prints the validated setup; voice-config remove clears it. Models are never downloaded; see docs/media.md.
 Send instructions directly, without a prefix. Shortcuts: status, pending, blocked, decisions, last result, more, help.
 Stop never logs the device out. Unlink it in WhatsApp's Linked devices when retiring it.
 Pending sends remain queued on failure; remote acceptance does not prove a human read.
@@ -114,7 +119,7 @@ export function doctorReport({ home, env = process.env, extensionRoot = root,
       if (!stat.isDirectory() || stat.isSymbolicLink()) problem(`private state directory ${name} must be a regular directory, not a symlink`);
       else if ((stat.mode & 0o777) !== 0o700) problem(`private state directory ${name} is mode ${(stat.mode & 0o777).toString(8)}; run chmod 700 ${name}`);
     }
-    for (const name of ['health.json', 'identity.json', 'recipient.json', 'enabled.json', 'expired.json', 'receive-health.json']) {
+    for (const name of ['health.json', 'identity.json', 'recipient.json', 'enabled.json', 'expired.json', 'receive-health.json', 'voice.json']) {
       const file = path.join(directory, name);
       const stat = lstatOrNull(file);
       if (stat && stat.isFile() && !stat.isSymbolicLink() && (stat.mode & 0o777) !== 0o600) problem(`private state file ${file} is mode ${(stat.mode & 0o777).toString(8)}; run chmod 600 ${file}`);
@@ -130,6 +135,10 @@ export function doctorReport({ home, env = process.env, extensionRoot = root,
     if (!recipient?.account) ok('recipient defaults to Message yourself');
     else if (canonicalJid(recipient.account) === recipient.account && recipient.account.endsWith('@s.whatsapp.net')) ok('a single second number is configured for this state');
     else problem('recipient configuration is invalid; stop the bridge and run recipient self or recipient +COUNTRYNUMBER');
+    const voiceFile = path.join(directory, 'voice.json');
+    if (!lstatOrNull(voiceFile)) note('offline voice transcription is not configured; voice-config set enables local whisper.cpp (optional, never downloads a model)');
+    else if (loadVoiceConfig({ file: () => voiceFile }).available) ok('offline voice transcription configuration validates');
+    else problem('voice.json is not a valid private transcription configuration; run voice-config inspect, then voice-config set to rewrite it');
     const lockFile = path.join(directory, 'run.lock');
     const lock = lstatOrNull(lockFile);
     if (!lock) ok('no live bridge holds this private state');
@@ -163,11 +172,22 @@ export function doctorReport({ home, env = process.env, extensionRoot = root,
 }
 export function parseArgs(argv) {
   const command = argv.shift() || 'help';
-  let qrFile, recipient, messageKey, progressState, attachmentFile, value, tokenFile, userId;
+  let qrFile, recipient, messageKey, progressState, attachmentFile, value, tokenFile, userId, voiceAction, voicePaths;
   if (command === 'progress' && argv.length === 2) [messageKey, progressState] = argv.splice(0);
   if (command === 'reply-file' && argv.length === 2) [messageKey, attachmentFile] = argv.splice(0);
   if (['summary', 'preferences'].includes(command) && argv.length) value = argv.splice(0).join(' ');
   if (command === 'telegram-config' && argv.length === 2) [tokenFile, userId] = argv.splice(0);
+  if (command === 'voice-config' && argv.length) {
+    const [action, ...rest] = argv;
+    if (action === 'set') {
+      if (rest.length < 3 || rest.length > 4) throw new Error('voice-config set requires FFMPEG WHISPER MODEL [LANGUAGE]');
+      voiceAction = 'set'; voicePaths = rest;
+    } else if (action === 'inspect' || action === 'remove') {
+      if (rest.length) throw new Error(`voice-config ${action} takes no arguments`);
+      voiceAction = action;
+    }
+    argv = [];
+  }
   if (command === 'reply' && argv.length === 1 && /^[a-f0-9]{64}$/.test(argv[0])) messageKey = argv.shift();
   if (command === 'recipient' && argv.length === 1) {
     recipient = argv.shift();
@@ -183,8 +203,9 @@ export function parseArgs(argv) {
       (command === 'reply-file' && !path.isAbsolute(attachmentFile ?? '')) ||
       (command === 'summary' && !['status', 'pending', 'blocked', 'decisions', 'last result', 'more'].includes(value)) ||
       (command === 'preferences' && !value) || (command === 'telegram-config' && (!tokenFile || !userId)) ||
-      !['pair', 'run', 'status', 'doctor', 'notify', 'reply', 'progress', 'reply-file', 'summary', 'preferences', 'voice-status', 'telegram-config', 'enable', 'disable', 'recipient', 'ping', 'help', '--help'].includes(command)) throw new Error('invalid command; use help');
-  return { command, qrFile, recipient, messageKey, progressState, attachmentFile, value, tokenFile, userId };
+      (command === 'voice-config' && !voiceAction) ||
+      !['pair', 'run', 'status', 'doctor', 'notify', 'reply', 'progress', 'reply-file', 'summary', 'preferences', 'voice-status', 'voice-config', 'telegram-config', 'enable', 'disable', 'recipient', 'ping', 'help', '--help'].includes(command)) throw new Error('invalid command; use help');
+  return { command, qrFile, recipient, messageKey, progressState, attachmentFile, value, tokenFile, userId, voiceAction, voicePaths };
 }
 export function qrSvg(code) {
   const size = code.getModuleCount(), edge = size + 8;
@@ -201,7 +222,7 @@ function writeQr(file, text) {
 }
 async function main(argv) {
   process.umask(0o077);
-  const { command, qrFile, recipient, messageKey, progressState, attachmentFile, value, tokenFile, userId } = parseArgs(argv);
+  const { command, qrFile, recipient, messageKey, progressState, attachmentFile, value, tokenFile, userId, voiceAction, voicePaths } = parseArgs(argv);
   if (command === 'help' || command === '--help') { process.stdout.write(help); return; }
   const home = process.env.FM_HOME;
   if (!home || !path.isAbsolute(home)) throw new Error('set FM_HOME to an absolute operational home');
@@ -222,6 +243,22 @@ async function main(argv) {
   if (command === 'status') { process.stdout.write(`${JSON.stringify(safeHealth(state))}\n`); return; }
   const store = new Store(home, state);
   if (command === 'voice-status') { process.stdout.write(`${JSON.stringify(loadVoiceConfig(store))}\n`); return; }
+  if (command === 'voice-config') {
+    if (voiceAction === 'set') {
+      const [ffmpeg, whisper, model, language] = voicePaths;
+      // Validation happens before any write: only a fully verified absolute local
+      // setup replaces the private configuration, atomically and mode 600 via writeJson.
+      const resolved = validateVoicePaths({ ffmpeg, whisper, model, language: language ?? 'en' });
+      writeJson(store.file('voice.json'), { schema: VOICE_CONFIG_SCHEMA, ffmpeg, whisper, model, language: resolved.language });
+      process.stdout.write(`offline voice transcription configured (language ${resolved.language}); private voice.json written mode 600\n`);
+      return;
+    }
+    if (voiceAction === 'inspect') { process.stdout.write(`${JSON.stringify(loadVoiceConfig(store))}\n`); return; }
+    try { fs.unlinkSync(store.file('voice.json')); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; process.stdout.write('voice configuration was not present\n'); return; }
+    process.stdout.write('voice configuration removed; voice notes are retained but no longer transcribed\n');
+    return;
+  }
   if (command === 'telegram-config') {
     await configureTelegram(store, tokenFile, userId);
     process.stdout.write('Telegram fallback paired; start the bridge and message the bot from that user.\n'); return;
