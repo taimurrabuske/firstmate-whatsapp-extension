@@ -129,3 +129,108 @@ test('a policy change cancels captured digest work rather than replaying it late
   policy.command('alerts completion on');
   assert.deepEqual(policy.plan(snapshot([event('pending')]), 8000), []);
 });
+
+test('digest pages pack whole events up to exactly 3500 characters and never split or truncate one', t => {
+  const { root, policy } = fixture(t);
+  policy.command('digest 1'); policy.plan(snapshot([]), 1);
+  // 18 prefix + 2 bullet + 3480 fills a page exactly; markup cannot fit 3481.
+  const full = { ...event('fills-page'), text: 'f'.repeat(3480) };
+  const markupUnfit = { ...event('unfit'), text: 'u'.repeat(3481) };
+  const small = event('small', 'failure');
+  assert.deepEqual(policy.plan(snapshot([full, markupUnfit, small]), 2), []);
+  const pages = policy.plan(snapshot([full, markupUnfit, small]), 62);
+  assert.equal(pages.length, 3);
+  assert.equal(pages[0].kind, 'digest');
+  assert.deepEqual(pages[0].sourceIds, ['fills-page']);
+  assert.equal(pages[0].text.length, 3500);
+  assert.ok(pages[0].text.includes(full.text));
+  // A source that fits WhatsApp but not digest markup stays whole and unchanged.
+  assert.deepEqual(pages[1].sourceIds, ['unfit']);
+  assert.equal(pages[1].kind, 'completion'); assert.deepEqual(pages[1].event, markupUnfit);
+  assert.equal(pages[1].text, markupUnfit.text);
+  assert.equal(pages[2].kind, 'digest'); assert.deepEqual(pages[2].sourceIds, ['small']);
+  for (const page of pages) assert.ok(page.text.length <= 3500);
+  // The whole uncommitted batch replays byte-identically after a restart.
+  const replay = new NotificationPolicy(root).plan(snapshot([full, markupUnfit, small]), 63);
+  assert.deepEqual(replay.map(page => [page.id, page.text, page.sourceIds]),
+    pages.map(page => [page.id, page.text, page.sourceIds]));
+});
+
+test('uncommitted urgent decisions suppress duplicates until commit, then stay silent', t => {
+  const { root, policy } = fixture(t);
+  policy.plan(snapshot([]), 1);
+  const first = policy.plan(snapshot([event('choice', 'decision')]), 2);
+  assert.equal(first.length, 1);
+  for (const tick of [3, 4]) {
+    const again = new NotificationPolicy(root).plan(snapshot([event('choice', 'decision')]), tick);
+    assert.deepEqual(again.map(item => [item.id, item.text, item.sourceIds]),
+      first.map(item => [item.id, item.text, item.sourceIds]));
+  }
+  policy.commit(first[0]);
+  assert.deepEqual(policy.plan(snapshot([event('choice', 'decision')]), 5), []);
+  assert.deepEqual(new NotificationPolicy(root).plan(snapshot([event('choice', 'decision')]), 6), []);
+});
+
+test('urgent decisions captured during quiet hours wait for the quiet window to close', t => {
+  const { policy } = fixture(t);
+  policy.command('quiet 22:00-08:00 UTC');
+  policy.plan(snapshot([]), Date.parse('2026-03-04T21:59:00Z') / 1000);
+  // Captured durably during quiet hours; never bypassed while quiet.
+  assert.deepEqual(policy.plan(snapshot([event('open', 'decision')], 's'),
+    Date.parse('2026-03-04T23:30:00Z') / 1000), []);
+  assert.equal(policy.allow({ session: 's', automatic: true, sourceEvents: [event('open', 'decision')] },
+    snapshot([event('open', 'decision')]), Date.parse('2026-03-04T23:30:00Z') / 1000), false);
+  // Lossless: the same open decision delivers immediately after quiet ends.
+  const after = policy.plan(snapshot([event('open', 'decision')], 's'),
+    Date.parse('2026-03-05T08:00:00Z') / 1000);
+  assert.equal(after.length, 1); assert.deepEqual(after[0].sourceIds, ['open']);
+  assert.equal(policy.allow(after[0], snapshot([event('open', 'decision')], 's'),
+    Date.parse('2026-03-05T08:00:00Z') / 1000), true);
+  policy.commit(after[0]);
+  assert.deepEqual(policy.plan(snapshot([event('open', 'decision')], 's'),
+    Date.parse('2026-03-05T09:00:00Z') / 1000), []);
+});
+
+test('pending digest work expires at the AFK boundary and is never delivered late', t => {
+  const { policy } = fixture(t);
+  policy.command('digest 60'); policy.command('alerts decisions urgent off');
+  policy.plan(snapshot([]), 100);
+  assert.deepEqual(policy.plan(snapshot([event('batched')], 'away-1'), 101), []);
+  // AFK ends before the digest timer; the captured pending alert must not cross
+  // the session boundary and returning cannot resurrect it.
+  assert.deepEqual(policy.plan({ schema: 'fm-whatsapp-events.v1', afk: false, session: '',
+    events: [event('batched')] }, 5000), []);
+  assert.deepEqual(policy.plan(snapshot([event('batched')], 'away-1'), 5001), []);
+  // A replacement session baselines historical outcomes instead of alerting them.
+  assert.deepEqual(policy.plan(snapshot([event('batched')], 'away-2'), 5002), []);
+  // A genuinely new outcome in the replacement session is captured, then waits
+  // out its own full digest interval before the page can fire.
+  assert.deepEqual(policy.plan(snapshot([event('batched'), event('new-one')], 'away-2'), 5003), []);
+  const fresh = policy.plan(snapshot([event('batched'), event('new-one')], 'away-2'), 5003 + 3600);
+  assert.deepEqual(fresh.map(item => item.sourceIds), [['new-one']]);
+});
+
+test('preferences persist exact values across restarts and damaged files fail closed precisely', t => {
+  const { root, policy } = fixture(t);
+  policy.command('alerts progress on');
+  policy.command('unsubscribe project alpha');
+  policy.command('subscribe task task-a');
+  policy.command('quiet 22:00-08:00 America/New_York');
+  policy.command('digest 15');
+  const file = path.join(root, 'notification-preferences.json');
+  const restored = new NotificationPolicy(root).preferences();
+  assert.equal(restored.digestMinutes, 15);
+  assert.deepEqual(restored.kinds, { completion: true, failure: true, decision: true, progress: true });
+  assert.equal(restored.projects.alpha, false); assert.equal(restored.tasks['task-a'], true);
+  assert.deepEqual(restored.quiet, { from: '22:00', to: '08:00', start: 1320, end: 480,
+    timezone: 'America/New_York' });
+  // A schema-bearing but incomplete file is damage: refuse with the precise
+  // stored-preferences error instead of an opaque TypeError in every operation.
+  fs.writeFileSync(file, JSON.stringify({ schema: 'fm-whatsapp-notifications.v1' }));
+  const damaged = new NotificationPolicy(root);
+  assert.throws(() => damaged.preferences(), /invalid notification preferences/);
+  assert.throws(() => damaged.plan(snapshot([]), 1), /invalid notification preferences/);
+  assert.throws(() => damaged.command('alerts on'), /invalid notification preferences/);
+  // The damaged file is never silently overwritten with defaults.
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).kinds, undefined);
+});
