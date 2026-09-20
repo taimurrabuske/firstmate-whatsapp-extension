@@ -26,7 +26,7 @@ Exact shortcuts (case-insensitive) are:
 - `quiet HH:MM-HH:MM IANA/Timezone`, `quiet off`
 - `digest MINUTES` (0–1440)
 
-Task subscription overrides project subscription; unspecified scopes default on. Progress defaults off. Decisions, failures, and completions default on. Decisions bypass digest by default but never bypass quiet hours or AFK. With urgent decisions disabled, they wait for the digest timer but each retains its own message so expiration and quoted task/key context cannot affect other reports. Preferences and the capture ledger are mode-0600 JSON in the mode-0700 state directory.
+Task subscription overrides project subscription; unspecified scopes default on. Progress defaults off. Decisions, failures, and completions default on. Decisions bypass digest by default but never bypass quiet hours or AFK. With urgent decisions disabled, they wait for the digest timer but each retains its own message so expiration and quoted task/key context cannot affect other reports. Preferences and the capture ledger are mode-0600 JSON in the mode-0700 state directory. A schema-bearing but structurally damaged preferences file — or an invalid ledger — fails closed on the next `plan`/`allow`/`command` call with an explicit error; it is never silently reset to defaults, so restore or replace the private file deliberately.
 
 ## Limits
 

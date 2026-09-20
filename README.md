@@ -70,13 +70,14 @@ In the configured chat (Message yourself by default, or the chat with the linked
 No prefix is required: ordinary text goes directly to Firstmate as a request.
 These exact summary commands and the notification preferences below are local shortcuts, ignoring case and surrounding whitespace.
 The older `!fm status`, `!fm help`, and `!fm note TEXT` forms remain accepted.
+You can read the same recorded summaries from the operator terminal with `./bin/fm-whatsapp.sh summary <shortcut>` (for example `summary pending` or `summary last result`), using the same environment as the bridge.
 
 The supervisor must be running and handling its inbox to answer conversational requests.
 Each note includes the path to this extension's [supervisor skill](skills/whatsapp-delegate/SKILL.md) and a reply command.
 No installation into Firstmate's tracked skill directory is required.
 Phone messages do not themselves end AFK mode or execute decisions.
 The bridge's immediate “saved” receipt is distinct from Firstmate's eventual answer.
-Requests now have durable IDs and explicit `received`, `picked-up`, `working`, `waiting`, `completed`, or `failed` states. Recent requests and answers supply bounded context to unquoted followups on the same authenticated route. Only the controller's explicit final reply records completion. An unanswered request can re-ring its existing wake up to three times; it never creates a second request or takes controller ownership. See [request lifecycle](docs/requests.md).
+Each request carries a durable ID and an explicit `received`, `picked-up`, `working`, `waiting`, `completed`, or `failed` state. Recent requests and answers supply bounded context to unquoted followups on the same authenticated route. Only the controller's explicit final reply records completion. An unanswered request can re-ring its existing wake up to three times; it never creates a second request or takes controller ownership. See [request lifecycle](docs/requests.md).
 
 Send a screenshot, a supported document, or a voice note from the same allowed chat. Voice transcription runs locally using ffmpeg and whisper.cpp when [configured](docs/media.md). Media is privately staged before handoff; limits are 8 MiB for images, 15 MiB for documents, and 10 MiB / thirty minutes for voice. Captions are not executed as commands: send accompanying instructions as a separate text message. Forwarded, view-once, and wrapped media are refused.
 
@@ -93,7 +94,8 @@ quiet 22:00-08:00 America/New_York
 digest 15
 ```
 
-Task preferences override project preferences; unspecified tasks/projects remain subscribed. Use `alerts off`, `quiet off`, or `digest 0` to disable each feature. Decisions bypass the digest timer by default, but still respect quiet hours; `alerts decisions urgent off` delays them too. Decisions always arrive separately so quoting one identifies its exact task/key. Long digests retain complete events across multiple messages. Returning from AFK expires its unsent proactive alerts. Direct request replies remain available. [Notification details](docs/notifications.md).
+Task preferences override project preferences; unspecified tasks/projects remain subscribed. Use `alerts off`, `quiet off`, or `digest 0` to disable each feature.
+Any of these commands also works from the operator terminal: `./bin/fm-whatsapp.sh preferences alerts progress on`. Decisions bypass the digest timer by default, but still respect quiet hours; `alerts decisions urgent off` delays them too. Decisions always arrive separately so quoting one identifies its exact task/key. Long digests retain complete events across multiple messages. Returning from AFK expires its unsent proactive alerts. Direct request replies remain available. [Notification details](docs/notifications.md).
 
 ## Connect the controlling Firstmate
 
@@ -152,6 +154,8 @@ Events reference the existing pending inbox notes and the external reply skill, 
 Only Firstmate decides how to handle the requests and acknowledges its notes and captured results.
 The adapter retains the exact result across retries before capture, then checks durable capture before advancing its cursor; empty polls rescan under the same request identity.
 Handled inbox notes are skipped even if their transport receipt still says `saved`.
+The cursor is derivable state: a changed configuration binding or corrupt cursor bytes reset to a fresh cursor and rescan every still-saved note, while an unknown cursor schema or invalid cursor contents fail closed for operator inspection.
+Changing `poll_ms` alone does not reset the cursor, and handled-note suppression entries are pruned so the seen set stays bounded.
 The source polls for at most 30 seconds per invocation and stays registered between requests.
 It reads local task metadata and requires no network or credential access; it never changes AFK mode.
 This closes the missing wake path, but does not promise exactly-once actions or delivery if local durable state is lost.
@@ -188,7 +192,7 @@ After a two-minute WhatsApp outage, newly queued responses with an explicitly bo
 
 ## Private state and lifecycle
 
-Bridge credentials, queues, receipts, and settings live outside Firstmate under the per-home directory in `${XDG_STATE_HOME:-~/.local/state}/firstmate-whatsapp/`.
+Bridge credentials, queues, receipts, and settings live outside Firstmate under the per-home directory `${XDG_STATE_HOME:-~/.local/state}/firstmate-whatsapp/<home-hash>/whatsapp/`, where `<home-hash>` derives from the canonical `FM_HOME`.
 Set `FM_DELEGATE_STATE` to an absolute directory to select another private location.
 `FM_STATE_OVERRIDE`, when used, selects Firstmate's state only.
 The extension binds its state to one Firstmate home to prevent accidental reuse.
@@ -199,7 +203,7 @@ Never commit or share these files.
 Stopping preserves the linked session; unlink it from the phone to revoke it.
 The runtime can be supervised by an existing process manager using the same explicit environment.
 Do not launch a second copy against the same state directory.
-After an unclean shutdown, inspect a reported stale lock and confirm its process is gone before removing that lock directory.
+After an unclean shutdown, inspect the reported `run.lock` and confirm its recorded process is gone before removing that lock directory.
 
 Inbound messages are accepted only from the selected private chat.
 Other contacts, groups, forwarded content, history, and unsupported media are ignored. Text is handed to the controller as a request, never evaluated as shell code by the bridge.

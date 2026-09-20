@@ -1,6 +1,6 @@
 # Media and offline voice integration
 
-`bin/fm-whatsapp/media.mjs` is transport-neutral and does not import Baileys or fetch URLs. The bridge injects its authenticated Baileys downloader only after metadata filtering. `MediaIntake` journals each accepted encrypted locator before asynchronous download/transcription, so a restart retains the intake and duplicate delivery cannot create another note.
+`bin/fm-whatsapp/media.mjs` is transport-neutral and does not import Baileys or fetch URLs. The bridge injects its authenticated Baileys downloader only after metadata filtering. `MediaIntake` journals each accepted encrypted locator before asynchronous download/transcription, so a restart retains the intake and duplicate delivery cannot create another note. A locator that fails three processing passes keeps its private record and queues one local failure notice instead of retrying silently.
 
 ## Exported API
 
@@ -37,4 +37,4 @@ const accepted = await authenticatedMediaMessage(message, identity, now, pairedA
 
 The caller remains responsible for durable deduplication before handoff, queueing the staged attachment with the authenticated reply route, and using its normal server-acknowledged send flow. Media acceptance does not change AFK state, approve work, or bypass Firstmate task/merge/spend gates.
 
-Long voice transcripts remain in a private `.transcript.txt` file; the inbox envelope includes its path and a bounded preview. The controller reads the full file. Use `voice-status` to inspect configuration. This installation can use the local English `base.en` model; no voice data is sent to a transcription service.
+Long voice transcripts remain in a private `.transcript.txt` file; the inbox envelope includes its path and a bounded preview. The controller reads the full file. Use `voice-status` to inspect configuration. An installation can use the local English `base.en` model; no voice data is sent to a transcription service.
