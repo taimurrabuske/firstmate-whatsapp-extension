@@ -78,7 +78,7 @@ Phone messages do not themselves end AFK mode or execute decisions.
 The bridge's immediate “saved” receipt is distinct from Firstmate's eventual answer.
 Requests now have durable IDs and explicit `received`, `picked-up`, `working`, `waiting`, `completed`, or `failed` states. Recent requests and answers supply bounded context to unquoted followups on the same authenticated route. Only the controller's explicit final reply records completion. An unanswered request can re-ring its existing wake up to three times; it never creates a second request or takes controller ownership. See [request lifecycle](docs/requests.md).
 
-Send a screenshot, a supported document, or a voice note from the same allowed chat. Voice transcription runs locally using ffmpeg and whisper.cpp when [configured](docs/media.md). Media is privately staged before handoff; limits are 8 MiB for images, 15 MiB for documents, and 10 MiB / five minutes for voice. Captions are not executed as commands: send accompanying instructions as a separate text message. Forwarded, view-once, and wrapped media are refused.
+Send a screenshot, a supported document, or a voice note from the same allowed chat. Voice transcription runs locally using ffmpeg and whisper.cpp when [configured](docs/media.md). Media is privately staged before handoff; limits are 8 MiB for images, 15 MiB for documents, and 10 MiB / thirty minutes for voice. Captions are not executed as commands: send accompanying instructions as a separate text message. Forwarded, view-once, and wrapped media are refused.
 
 ## Notifications
 

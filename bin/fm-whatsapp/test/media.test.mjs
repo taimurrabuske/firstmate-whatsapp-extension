@@ -107,6 +107,20 @@ test('second-number inbound route and voice metadata preserve fromMe policy', ()
   assert.equal(authenticateMediaMetadata(media({ ...voice, ptt: false }, {}, 'audioMessage'), identity, 1010, 1000), null);
 });
 
+test('thirty-minute voice metadata is accepted and over-limit duration is refused before download', async t => {
+  const { store } = fixture(t); let downloads = 0;
+  assert.equal(MEDIA_LIMITS.voiceSeconds, 1800);
+  const voice = seconds => ({ mimetype: 'audio/ogg; codecs=opus', fileLength: 20, seconds, ptt: true });
+  const accepted = authenticateMediaMetadata(media(voice(1800), {}, 'audioMessage'), identity, 1010, 1000);
+  assert.equal(accepted.kind, 'voice'); assert.equal(accepted.duration, 1800);
+  assert.equal(authenticateMediaMetadata(media(voice(1801), {}, 'audioMessage'), identity, 1010, 1000), null);
+  const result = await authenticatedMediaMessage(media({ mimetype: 'audio/ogg; codecs=opus', fileLength: 9, seconds: MEDIA_LIMITS.voiceSeconds, ptt: true }, {}, 'audioMessage'),
+    identity, 1010, 1000, null,
+    { store, download: async () => { downloads++; return Buffer.from('OggSvoice'); },
+      transcribe: async () => ({ available: true, text: 'long note transcript' }) });
+  assert.equal(downloads, 1); assert.match(result.text, /voice note received/);
+});
+
 test('long local voice transcripts remain complete on disk with a bounded inbox preview', async t => {
   const { store } = fixture(t), bytes = Buffer.from('OggSvoice');
   const transcript = 'Full transcript sentence. '.repeat(220);
