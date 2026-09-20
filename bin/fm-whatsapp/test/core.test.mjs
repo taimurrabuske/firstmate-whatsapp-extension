@@ -54,10 +54,11 @@ test('configured second number accepts its incoming PN/LID chat and rejects self
     assert.equal(authenticatedMessage(incoming(key), identity, 1010, 1000, peer), null);
   }
   assert.ok(authenticatedMessage(incoming({ remoteJid: '9988@lid', remoteJidAlt: peer.account }), identity, 1010, 1000, peer));
+  assert.ok(authenticatedMessage(incoming({ remoteJid: '9988@lid', remoteJidAlt: peer.account, participant: '', participantAlt: undefined }), identity, 1010, 1000, peer));
   assert.ok(authenticatedMessage(incoming({ remoteJid: '9988@lid', remoteJidAlt: peer.account }), identity, 1010, 1000,
     { account: peer.account, aliases: [peer.account] }));
   assert.equal(authenticatedMessage(incoming({ remoteJid: 'different@g.us', remoteJidAlt: peer.account }), identity, 1010, 1000, peer), null);
-  await f.bridge.receive(batch(incoming(), incoming({ remoteJid: '9988@lid' })));
+  await f.bridge.receive(batch(incoming({ participant: '' }), incoming({ remoteJid: '9988@lid' })));
   assert.equal(f.calls.inbox.length, 1);
   await f.bridge.flush();
   assert.equal(f.calls.sent[0].jid, peer.account);

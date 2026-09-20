@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { FirstmateAdapter } from './firstmate.mjs';
-import { Acknowledgements, Bridge, Store, readJson, writeJson, delegateState, verifyHomeBinding, ownIdentity, canonicalJid, epoch, MAX_TEXT, validateSnapshot } from './core.mjs';
+import { Acknowledgements, Bridge, Store, readJson, writeJson, delegateState, verifyHomeBinding, ownIdentity, canonicalJid, authenticatedMessage, validText, epoch, MAX_TEXT, validateSnapshot } from './core.mjs';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const help = `Usage: FM_HOME=/absolute/home bin/fm-whatsapp.sh <command>
   pair [--qr-file /absolute/file]  Display a QR (SVG when file ends .svg), exit after linking.
@@ -216,6 +216,14 @@ async function main(argv) {
             fields: Object.keys(message.message ?? {}),
             contextFields: Object.keys(message.message?.extendedTextMessage?.contextInfo ?? {}),
             timestampRecent: Number(message.messageTimestamp) >= bridge.pairedAt,
+            timestampAge: epoch() - Number(message.messageTimestamp),
+            idValid: /^[A-Za-z0-9_-]{1,128}$/.test(message.key?.id ?? ''),
+            optionalAddresses: ['participant', 'participantAlt'].map(field => ({ field,
+              absent: message.key?.[field] == null, empty: message.key?.[field] === '',
+              matches: identity?.aliases.includes(canonicalJid(message.key?.[field])) })),
+            textValid: validText(message.message?.conversation ?? message.message?.extendedTextMessage?.text),
+            recognizedCommand: /^!fm\s+(status|help|note)(?:\s|$)/i.test(message.message?.conversation ?? message.message?.extendedTextMessage?.text ?? ''),
+            authenticated: Boolean(authenticatedMessage(message, bridge.identity, epoch(), bridge.pairedAt, bridge.peer)),
             stubType: message.messageStubType ?? null
           }));
           writeJson(store.file('receive-health.json'), { at: epoch(), type: batch.type, messages: diagnostics });

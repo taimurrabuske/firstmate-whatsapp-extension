@@ -79,7 +79,9 @@ export function authenticatedMessage(message, identity, now, pairedAt, peer = nu
   const owns = jid => aliases.includes(canonicalJid(jid));
   if (!owns(key.remoteJid)) return null;
   for (const field of ['remoteJidAlt', 'participant', 'participantAlt']) {
-    if (key[field] != null && !owns(key[field])) return null;
+    // Direct-message stanzas can carry participant="". It means absent,
+    // not another sender; any nonempty alternate identity must still match.
+    if (key[field] != null && key[field] !== '' && !owns(key[field])) return null;
   }
   const timestamp = Number(message.messageTimestamp);
   if (!Number.isFinite(timestamp) || timestamp < pairedAt || timestamp < now - 86400 || timestamp > now + 300) return null;
