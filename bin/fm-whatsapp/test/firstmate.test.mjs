@@ -139,3 +139,46 @@ test('recipient configuration requires an idle bridge and empty queues; never ch
   assert.equal(run('self').status, 1);
   assert.deepEqual(fs.readdirSync(f.home), []);
 });
+
+test('request-bound reply queues outside AFK, repeats safely, and cannot target another route or home', async t => {
+  const f = fixture(t);
+  const route = { account: '15555550123@s.whatsapp.net', recipient: '15555550999@s.whatsapp.net' };
+  writeJson(f.store.file('identity.json'), { account: route.account, pairedAt: 1000 });
+  writeJson(f.store.file('recipient.json'), { account: route.recipient });
+  writeJson(f.store.file(`pending/${key}.json`), { operation: 'note', route });
+  const adapter = new FirstmateAdapter({ ...f.options, run: async (_file, _args, options) => {
+    saveNote(f, options.input); return 'queued 1000-abcdef\n';
+  } });
+  await adapter.note(key, 'Please answer');
+  f.store.markIncoming(key, epoch(), { operation: 'note', route });
+  fs.unlinkSync(f.store.file(`pending/${key}.json`));
+  const receipt = readJson(f.store.file(`handoffs/${key}.json`));
+  assert.deepEqual(receipt.route, route);
+  assert.match(receipt.body, /"arguments":\["reply","[a-f0-9]{64}"\]/);
+  const cli = path.join(root, 'bin/fm-whatsapp/cli.mjs');
+  const env = { ...process.env, FM_HOME: f.home, FM_DELEGATE_STATE: f.state,
+    FM_CODE_ROOT: f.options.codeRoot, FM_STATE_OVERRIDE: f.options.state };
+  const respond = (args = ['reply', key], extraEnv = {}) => spawnSync(process.execPath, [cli, ...args],
+    { env: { ...env, ...extraEnv }, input: 'The result is ready.\n', encoding: 'utf8' });
+  assert.equal(respond().status, 0);
+  assert.equal(respond().status, 0);
+  assert.equal(f.store.records('outbox').length, 1);
+  f.store.pruneIncoming(epoch() + 86401);
+  assert.equal(f.store.incoming(key), null);
+  assert.equal(respond().status, 0); // Durable handoff permits the result of long work.
+  const job = readJson(f.store.file(`outbox/${f.store.records('outbox')[0]}`));
+  assert.equal(job.kind, 'reply'); assert.equal(job.session, ''); assert.equal(job.requestKey, key);
+  assert.deepEqual(job.route, route);
+  assert.equal(respond(['reply', '../escape']).status, 1);
+  assert.equal(respond(['reply', 'a'.repeat(64)]).status, 1);
+  assert.equal(respond(['reply', key], { FM_STATE_OVERRIDE: path.join(f.home, 'different-state') }).status, 1);
+  assert.equal(respond(['reply', key], { FM_CODE_ROOT: path.join(f.base, 'different-code') }).status, 1);
+  writeJson(f.store.file('recipient.json'), { account: '15555550888@s.whatsapp.net' });
+  assert.equal(respond().status, 1);
+  writeJson(f.store.file('recipient.json'), { account: route.recipient });
+  receipt.phase = 'uncertain'; writeJson(f.store.file(`handoffs/${key}.json`), receipt);
+  assert.equal(respond().status, 1);
+  assert.equal(f.store.records('outbox').length, 1);
+  assert.equal(readJson(f.store.file('enabled.json')), null);
+  assert.ok(!fs.existsSync(path.join(f.home, 'state/afk-contract.md')));
+});

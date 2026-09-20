@@ -51,6 +51,9 @@ export function canonicalJid(jid) {
   const match = /^(\d+)(?::\d+)?@(s\.whatsapp\.net|lid)$/.exec(jid);
   return match ? `${match[1]}@${match[2]}` : null;
 }
+export function sameRoute(left, right) {
+  return Boolean(left && right && left.account === right.account && left.recipient === right.recipient);
+}
 export function ownIdentity(user) {
   const account = canonicalJid(user?.id);
   if (!account || !account.endsWith('@s.whatsapp.net')) throw new Error('authenticated phone identity unavailable');
@@ -137,14 +140,24 @@ export class Store {
   file(name) { return path.join(this.root, name); }
   records(name) { return fs.readdirSync(this.file(name)).filter(f => /^[a-f0-9]{64}\.json$/.test(f)).sort(); }
   incoming(key) { return readJson(this.file(`incoming/${key}.json`)); }
-  markIncoming(key, now) { writeJson(this.file(`incoming/${key}.json`), { at: now }); }
+  markIncoming(key, now, request = {}) {
+    writeJson(this.file(`incoming/${key}.json`), { at: now, operation: request.operation, route: request.route });
+  }
+  currentRoute() {
+    const account = readJson(this.file('identity.json'))?.account;
+    const recipient = readJson(this.file('recipient.json'))?.account || account;
+    for (const value of [account, recipient]) {
+      if (!value?.endsWith('@s.whatsapp.net') || canonicalJid(value) !== value) throw new Error('authenticated route unavailable');
+    }
+    return { account, recipient };
+  }
   pruneIncoming(now) {
     for (const file of this.records('incoming')) {
       const record = readJson(this.file(`incoming/${file}`));
       if (record.at < now - 86400) fs.unlinkSync(this.file(`incoming/${file}`));
     }
   }
-  enqueue(text, { kind = 'alert', session, id = crypto.randomUUID(), automatic = false, now = epoch() } = {}) {
+  enqueue(text, { kind = 'alert', session, id = crypto.randomUUID(), automatic = false, route, requestKey, now = epoch() } = {}) {
     if (!validText(text) || !['alert', 'reply'].includes(kind) || typeof session !== 'string') throw new Error('invalid outbound message');
     const queueLock = this.file('queue.lock');
     try { fs.mkdirSync(queueLock, { mode: 0o700 }); }
@@ -156,7 +169,7 @@ export class Store {
       if (this.records('outbox').length >= MAX_QUEUE) throw new Error('outbound queue full');
       // Independent immutable queue entries permit notify while run holds its process lock.
       const temp = this.file(`outbox/.${crypto.randomUUID()}.tmp`);
-      writeJson(temp, { key, kind, session, text, automatic, eventId: id, created: now, attempts: 0, next: 0,
+      writeJson(temp, { key, kind, session, text, automatic, route, requestKey, eventId: id, created: now, attempts: 0, next: 0,
         remoteId: `3EB0${crypto.randomBytes(14).toString('hex').toUpperCase()}` });
       try { fs.linkSync(temp, target); }
       catch (error) { if (error.code !== 'EEXIST') throw error; }
@@ -277,7 +290,9 @@ export class Bridge {
       if (this.store.records('pending').length >= MAX_QUEUE) {
         this.problem = 'incoming queue full; new messages require retry'; this.health(); break;
       }
-      writeJson(file, { key: incoming.key, account: this.identity.account, operation, body, attempts: 0, next: 0 });
+      writeJson(file, { key: incoming.key, account: this.identity.account,
+        route: { account: this.identity.account, recipient: (this.peer ?? this.identity).account },
+        operation, body, attempts: 0, next: 0 });
     }
   }
   async receive(batch) {
@@ -294,7 +309,8 @@ export class Bridge {
       if (job.next > this.clock()) continue;
       if (++attempted > 20) break;
       try {
-        if (job.account !== this.identity.account) throw new Error('pending account mismatch');
+        if (job.account !== this.identity.account || (job.route && !sameRoute(job.route,
+          { account: this.identity.account, recipient: (this.peer ?? this.identity).account }))) throw new Error('pending route mismatch');
         if (this.store.records('incoming').length >= MAX_SEEN) throw new Error('incoming receipt limit reached');
         let response;
         if (job.operation === 'status') response = (await this.status()).slice(0, MAX_TEXT);
@@ -305,7 +321,7 @@ export class Bridge {
           response = 'Your note is saved for Firstmate. Away mode is unchanged; this receipt does not mean any action was approved or completed.';
         } else throw new Error('invalid pending operation');
         this.store.enqueue(response, { kind: 'reply', session: '', id: job.key, now: this.clock() });
-        this.store.markIncoming(job.key, this.clock());
+        this.store.markIncoming(job.key, this.clock(), job);
         fs.unlinkSync(file);
       } catch (error) {
         job.uncertain = error.code === 'FM_NOTE_UNCERTAIN';
@@ -328,6 +344,9 @@ export class Bridge {
       const job = readJson(location);
       if (!job || job.next > this.clock()) continue;
       if (job.kind === 'alert' && (!gate.afk || job.session !== gate.session)) continue;
+      if (job.route && !sameRoute(job.route, { account: this.identity.account, recipient: (this.peer ?? this.identity).account })) {
+        this.problem = 'reply route changed; queued response retained for inspection'; this.health(); continue;
+      }
       if (this.store.records('sent').length >= MAX_SEEN) {
         this.problem = 'delivery receipt limit reached; inspect private state'; this.health(); return;
       }

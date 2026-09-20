@@ -49,7 +49,8 @@ In another terminal with the same environment, enable AFK notifications:
 ```
 
 Use Firstmate's ordinary AFK procedure to enter away mode.
-The extension requires a confirmed AFK record before sending automatic questions or supervisor replies.
+The extension requires a confirmed AFK record before sending automatic questions and other proactive alerts.
+Responses to an accepted phone request work with or without AFK mode.
 Its enablement is separate from Firstmate's stored `reach_channels: none` profile, which remains unchanged.
 It observes subsequent confirmed AFK sessions until disabled.
 Firstmate retains hold-for-return behavior whenever a response is unavailable.
@@ -73,12 +74,80 @@ No installation into Firstmate's tracked skill directory is required.
 Phone messages do not themselves end AFK mode or execute decisions.
 The bridge's immediate “saved” receipt is distinct from Firstmate's eventual answer.
 
-The supervisor sends answers using this repository's script, with text on stdin:
+## Connect the controlling Firstmate
+
+Saving an inbox note alone does not reliably wake an idle Firstmate.
+Install this repository's small `whatsapp-inbox` process-event package once per home so its existing watcher surfaces saved phone requests to the active controller.
+The package uses Firstmate's supported external binding interface and leaves its source repository unchanged.
+The controller must remain running with its ordinary watcher healthy.
+
+First prepare a private copy **outside every Git checkout and outside Firstmate's home**.
+Set `FM_DELEGATE_STATE` to the same absolute per-home state directory used by the bridge, and `FM_HOME`/`FM_CODE_ROOT` as above.
+From this extension's checkout:
+
+```bash
+export WHATSAPP_EXTENSION_ROOT="$PWD"
+export WHATSAPP_ADAPTER_STAGE="$HOME/.local/share/firstmate-whatsapp/inbox-adapter-1.0.0"
+export WHATSAPP_ADAPTER_CONFIG="$FM_DELEGATE_STATE/inbox-adapter.json"
+mkdir -p "$WHATSAPP_ADAPTER_STAGE/bin"
+cp adapter/firstmate-extension.json "$WHATSAPP_ADAPTER_STAGE/"
+cp adapter/bin/firstmate-extension.mjs "$WHATSAPP_ADAPTER_STAGE/bin/"
+chmod 755 "$WHATSAPP_ADAPTER_STAGE" "$WHATSAPP_ADAPTER_STAGE/bin" "$WHATSAPP_ADAPTER_STAGE/bin/firstmate-extension.mjs"
+chmod 644 "$WHATSAPP_ADAPTER_STAGE/firstmate-extension.json"
+node --input-type=module <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+const env = process.env;
+const config = {
+  schema: 'firstmate.whatsapp-inbox-config.v1',
+  source_id: 'whatsapp-inbox-main',
+  whatsapp_state: fs.realpathSync(path.join(env.FM_DELEGATE_STATE, 'whatsapp')),
+  fm_home: fs.realpathSync(env.FM_HOME),
+  fm_state: fs.realpathSync(env.FM_STATE_OVERRIDE || path.join(env.FM_HOME, 'state')),
+  extension_root: fs.realpathSync(env.WHATSAPP_EXTENSION_ROOT),
+  poll_ms: 30000
+};
+fs.writeFileSync(env.WHATSAPP_ADAPTER_CONFIG, JSON.stringify(config) + '\n', { mode: 0o600, flag: 'wx' });
+NODE
+```
+
+The active Firstmate owner loads its `process-event-sources` skill, then binds and registers this explicitly trusted same-user package:
+
+```bash
+"$FM_CODE_ROOT/bin/fm-extension.sh" bind "$WHATSAPP_ADAPTER_STAGE" \
+  --adapter whatsapp-inbox --trust-same-user-code --consent task-metadata --timeout-ms 45000
+"$FM_CODE_ROOT/bin/fm-procevent.sh" register-extension whatsapp-inbox whatsapp-inbox-main \
+  --config-ref "$WHATSAPP_ADAPTER_CONFIG"
+"$FM_CODE_ROOT/bin/fm-procevent.sh" reconcile
+"$FM_CODE_ROOT/bin/fm-procevent.sh" list
+```
+
+Confirm the source is reported `live`; a registration alone does not prove a runner is listening.
+Preserve the exact token-bound retirement command printed during registration if the source must later be removed.
+Do not run the polling entrypoint or `fm-procevent.sh start` in a conversational turn.
+Package upgrades require owner-matched source and binding retirement after handling existing captured results; replacing the staged files does not alter an installed binding.
+
+Events reference the existing pending inbox notes and the external reply skill, without copying phone text into the wake.
+Only Firstmate decides how to handle the requests and acknowledges its notes and captured results.
+The adapter retains the exact result across retries before capture, then checks durable capture before advancing its cursor; empty polls rescan under the same request identity.
+Handled inbox notes are skipped even if their transport receipt still says `saved`.
+The source polls for at most 30 seconds per invocation and stays registered between requests.
+It reads local task metadata and requires no network or credential access; it never changes AFK mode.
+This closes the missing wake path, but does not promise exactly-once actions or delivery if local durable state is lost.
+
+## Reply from Firstmate
+
+The supervisor uses the exact message key and environment in the received envelope, with its answer on stdin:
 
 ```bash
 printf '%s\n' 'The simulation finished; the result meets the stated target.' |
-  ./bin/fm-whatsapp.sh notify
+  ./bin/fm-whatsapp.sh reply "$MESSAGE_KEY"
 ```
+
+`reply` requires a published authenticated request on the current account, recipient, and Firstmate configuration.
+It refuses unknown message keys, uncertain handoffs, and route changes.
+Identical responses to the same request are deduplicated; different acknowledgements and final answers can both be sent.
+Use `notify` for proactive messages during confirmed AFK sessions.
 
 Ordinary help/status/receipt replies work while the bridge is running, including outside AFK.
 Automatic notices cover unresolved recorded `needs-decision` keys for tasks that still have metadata.

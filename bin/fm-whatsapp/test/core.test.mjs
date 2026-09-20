@@ -360,3 +360,21 @@ test('uncertain inbound publication stays visible through refresh and outgoing d
   assert.match(health.problem, /inspect handoff receipt/);
   const visible = safeHealth(f.state, 1000); assert.equal(visible.uncertain, 1); assert.equal(visible.pending, 1);
 });
+
+test('supervisor replies survive absent AFK but never move to a changed recipient', async t => {
+  const f = fixture(t);
+  f.setSnapshot({ schema: 'fm-whatsapp-events.v1', afk: false, session: '', events: [] });
+  const route = { account: identity.account, recipient: identity.account };
+  f.store.enqueue('Your requested result.', { kind: 'reply', session: '', route, requestKey: 'b'.repeat(64) });
+  f.bridge.peer = { account: '15555550999@s.whatsapp.net', aliases: ['15555550999@s.whatsapp.net'] };
+  await f.bridge.flush();
+  assert.equal(f.calls.sent.length, 0);
+  assert.equal(f.store.records('outbox').length, 1);
+  assert.match(readJson(f.store.file('health.json')).problem, /route changed/);
+  f.bridge.peer = null;
+  await f.bridge.flush();
+  assert.equal(f.calls.sent.length, 1);
+  assert.equal(f.calls.sent[0].jid, identity.account);
+  assert.match(f.calls.sent[0].text, /Your requested result/);
+  assert.equal(f.store.records('outbox').length, 0);
+});

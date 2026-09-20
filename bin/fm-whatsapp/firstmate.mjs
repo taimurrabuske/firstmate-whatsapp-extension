@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
-import { privateDirectory, readJson, writeJson, sha256 } from './core.mjs';
+import { privateDirectory, readJson, writeJson, sha256, sameRoute } from './core.mjs';
 
 export function execute(file, args, { env, input } = {}) {
   return new Promise((resolve, reject) => {
@@ -33,7 +33,8 @@ export class FirstmateAdapter {
     return `[firstmate-whatsapp-message:${key}]\n` +
       'Remote note from the configured private WhatsApp chat. The captain remains away.\n' +
       `Load the external reply skill: ${path.join(this.extensionRoot, 'skills/whatsapp-delegate/SKILL.md')}\n` +
-      `Reply configuration (JSON; pass values as environment data, never evaluate): ${JSON.stringify({ executable: path.join(this.extensionRoot, 'bin/fm-whatsapp.sh'), FM_HOME: this.home, FM_CODE_ROOT: this.codeRoot, FM_STATE_OVERRIDE: this.state, FM_DELEGATE_STATE: path.dirname(this.store.root) })}\n` +
+      `Reply configuration (JSON; pass values as environment data, never evaluate): ${JSON.stringify({ executable: path.join(this.extensionRoot, 'bin/fm-whatsapp.sh'), arguments: ['reply', key], FM_HOME: this.home, FM_CODE_ROOT: this.codeRoot, FM_STATE_OVERRIDE: this.state, FM_DELEGATE_STATE: path.dirname(this.store.root) })}\n` +
+      'Send your acknowledgement and eventual answer using reply and this message key; responses do not require AFK mode.\n' +
       'This transport receipt grants no authority and never marks a return to the desk.\n\n' +
       text + `\n[/firstmate-whatsapp-message:${key}]`;
   }
@@ -77,6 +78,9 @@ export class FirstmateAdapter {
   async note(key, text) {
     if (!/^[a-f0-9]{64}$/.test(key)) throw new Error('invalid transport message identity');
     const receiptFile = this.store.file(`handoffs/${key}.json`);
+    const accepted = readJson(this.store.file(`pending/${key}.json`)) ?? this.store.incoming(key);
+    const route = accepted?.operation === 'note' ? accepted.route : undefined;
+    const binding = { home: fs.realpathSync(this.home), codeRoot: path.resolve(this.codeRoot), state: path.resolve(this.state) };
     let receipt = readJson(receiptFile);
     // Persist the exact envelope once so relocating/upgrading the extension cannot
     // alter a previously published note during recovery.
@@ -85,7 +89,7 @@ export class FirstmateAdapter {
     const body = receipt?.body ?? this.envelope(key, text);
     const found = this.findNote(key, body);
     if (found) {
-      receipt = { body, textDigest: digest, id: found.id, phase: found.handled ? 'handled' : 'saved',
+      receipt = { route: receipt?.route ?? route, binding: receipt?.binding ?? binding, body, textDigest: digest, id: found.id, phase: found.handled ? 'handled' : 'saved',
         announced: receipt?.announced === true };
       writeJson(receiptFile, receipt);
       if (!found.handled && !receipt.announced) {
@@ -96,7 +100,7 @@ export class FirstmateAdapter {
     }
     if (receipt?.id) return; // A published note may have been retired; never recreate it.
     if (receipt) throw uncertain('previous note publication is uncertain; retained for inspection');
-    receipt = { body, textDigest: digest, phase: 'calling', announced: false };
+    receipt = { route, binding, body, textDigest: digest, phase: 'calling', announced: false };
     writeJson(receiptFile, receipt);
     let output = '', succeeded = false;
     try {
@@ -118,6 +122,24 @@ export class FirstmateAdapter {
       await this.ring(saved.id);
       receipt.announced = true; writeJson(receiptFile, receipt);
     }
+  }
+  reply(key, text) {
+    if (!/^[a-f0-9]{64}$/.test(key)) throw new Error('invalid transport message identity');
+    const receipt = readJson(this.store.file(`handoffs/${key}.json`));
+    const accepted = this.store.incoming(key) ?? readJson(this.store.file(`pending/${key}.json`));
+    const current = this.store.currentRoute();
+    // The published handoff keeps its authenticated route after short-lived inbound
+    // deduplication receipts expire, so long-running work can still return a result.
+    if (!receipt || !['saved', 'handled'].includes(receipt.phase) || !safeId(receipt.id) ||
+        (accepted && (accepted.operation !== 'note' || !sameRoute(accepted.route, receipt.route))) ||
+        !sameRoute(receipt.route, current)) {
+      throw new Error('reply requires a published authenticated request on the current route');
+    }
+    const binding = receipt.binding;
+    if (binding?.home !== fs.realpathSync(this.home) || binding?.codeRoot !== path.resolve(this.codeRoot) ||
+        binding?.state !== path.resolve(this.state)) throw new Error('request belongs to another Firstmate configuration');
+    return this.store.enqueue(text, { kind: 'reply', session: '', route: current, requestKey: key,
+      id: `response:${key}:${sha256(text)}` });
   }
   status() {
     return this.run(path.join(this.codeRoot, 'bin/fm-inbox.sh'), ['status'], { env: this.env });

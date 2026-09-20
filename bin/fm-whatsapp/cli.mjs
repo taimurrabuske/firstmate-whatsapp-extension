@@ -10,6 +10,7 @@ const help = `Usage: FM_HOME=/absolute/home bin/fm-whatsapp.sh <command>
   pair [--qr-file /absolute/file]  Display a QR (SVG when file ends .svg), exit after linking.
   run                            Run the self-chat bridge until stopped with SIGINT/SIGTERM.
   status                         Print private bridge health without connecting.
+  reply <message-key>            Queue stdin response to an accepted phone request, including outside AFK.
   notify                         Queue stdin text for the enabled delegate's current AFK session.
   enable                         Opt in to alerts while Firstmate is away (requires live bridge).
   disable                        Disable alerts; preserve credentials and saved notes.
@@ -44,7 +45,8 @@ export function safeHealth(state, now = epoch()) {
 }
 function parseArgs(argv) {
   const command = argv.shift() || 'help';
-  let qrFile, recipient;
+  let qrFile, recipient, messageKey;
+  if (command === 'reply' && argv.length === 1 && /^[a-f0-9]{64}$/.test(argv[0])) messageKey = argv.shift();
   if (command === 'recipient' && argv.length === 1) {
     recipient = argv.shift();
     if (recipient !== 'self' && !/^\+[1-9]\d{7,14}$/.test(recipient)) throw new Error('use an international phone number');
@@ -53,8 +55,8 @@ function parseArgs(argv) {
     qrFile = argv[1]; argv = [];
     if (!path.isAbsolute(qrFile)) throw new Error('QR file must be an absolute path');
   }
-  if (argv.length || (command === 'recipient' && !recipient) || !['pair', 'run', 'status', 'notify', 'enable', 'disable', 'recipient', 'ping', 'help', '--help'].includes(command)) throw new Error('invalid command; use help');
-  return { command, qrFile, recipient };
+  if (argv.length || (command === 'recipient' && !recipient) || (command === 'reply' && !messageKey) || !['pair', 'run', 'status', 'notify', 'reply', 'enable', 'disable', 'recipient', 'ping', 'help', '--help'].includes(command)) throw new Error('invalid command; use help');
+  return { command, qrFile, recipient, messageKey };
 }
 export function qrSvg(code) {
   const size = code.getModuleCount(), edge = size + 8;
@@ -71,7 +73,7 @@ function writeQr(file, text) {
 }
 async function main(argv) {
   process.umask(0o077);
-  const { command, qrFile, recipient } = parseArgs(argv);
+  const { command, qrFile, recipient, messageKey } = parseArgs(argv);
   if (command === 'help' || command === '--help') { process.stdout.write(help); return; }
   const home = process.env.FM_HOME;
   if (!home || !path.isAbsolute(home)) throw new Error('set FM_HOME to an absolute operational home');
@@ -103,7 +105,7 @@ async function main(argv) {
   }
   const adapter = new FirstmateAdapter({ home, codeRoot, state: firstmateState, store, extensionRoot: root });
   const events = () => adapter.events();
-  if (command === 'notify') {
+  if (command === 'notify' || command === 'reply') {
     const chunks = []; let count = 0;
     for await (const chunk of process.stdin) {
       count += chunk.length;
@@ -111,6 +113,9 @@ async function main(argv) {
       chunks.push(chunk);
     }
     const text = Buffer.concat(chunks).toString('utf8').replace(/\r?\n$/, '');
+    if (command === 'reply') {
+      process.stdout.write(`queued ${adapter.reply(messageKey, text)}\n`); return;
+    }
     const current = validateSnapshot(await events());
     if (!current.afk) throw new Error('the delegate must be enabled and Firstmate away; nothing queued');
     const key = store.enqueue(text, { session: current.session });

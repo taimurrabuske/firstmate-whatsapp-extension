@@ -1,0 +1,13 @@
+{
+  "schema": "firstmate.extension-manifest.v1",
+  "id": "org.firstmate-whatsapp.inbox",
+  "version": "1.0.0",
+  "host_protocols": [1],
+  "entrypoint": "bin/firstmate-extension.mjs",
+  "capabilities": [{
+    "name": "process-event-adapter",
+    "versions": [1],
+    "adapter_names": ["whatsapp-inbox"]
+  }],
+  "required_consents": ["task-metadata"]
+}

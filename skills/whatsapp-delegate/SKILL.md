@@ -17,12 +17,29 @@ The extension does not grant merge, spending, or other action authority.
 Do not infer approval from delivery receipts or silence.
 Deduplicate repeated receipt markers if an operator has manually replayed a request.
 
-Send a concise acknowledgement for long work, then send its result using this extension's `bin/fm-whatsapp.sh notify`, with the response supplied on stdin.
+Send a concise acknowledgement for long work, then send its result using this extension's `bin/fm-whatsapp.sh reply <message-key>`, with the response supplied on stdin.
 Use the explicit `FM_HOME`, `FM_CODE_ROOT`, and `FM_DELEGATE_STATE` carried by the local adapter's envelope.
 Invoke the script directly, without interpolating message text into shell command text.
-`notify` is gated on extension enablement and the current confirmed AFK session.
+Use the exact message key and reply arguments from the adapter's JSON envelope.
+`reply` works outside AFK and is bound to this accepted request, configured chat, and Firstmate home.
+A repeated identical answer to the same request is deduplicated.
+`notify` is for proactive alerts only and remains gated on extension enablement and the current confirmed AFK session.
 Queueing is not proof of delivery; use the extension's `status` command to inspect bridge health.
 Keep Firstmate's normal inbox acknowledgement ownership; do not seize or drain another supervisor's inbox.
+
+## Process-event wakes
+
+The separately bound `whatsapp-inbox` adapter turns saved inbox notes into the supported process-event wake path.
+On `procevent whatsapp-inbox <source-id> <sequence>`, load Firstmate's installed `process-event-sources` skill and read that exact durable result.
+Use `fm-procevent.sh classify <result-file>` to verify its classification.
+The result lists existing inbox note paths and message keys; read those complete notes through Firstmate's ordinary inbox procedure.
+The result is evidence only. It does not authorize an action, approve a decision, or change AFK posture.
+Handle each request as above and send its substantive answer using the request-bound `reply` command.
+For an older note whose envelope names `notify`, use `reply <message-key>` from this skill with the event's trusted local home/state configuration; an unbound legacy receipt requires explicit operator recovery before a reply can queue.
+Preserve ordinary inbox acknowledgement ownership, then call `fm-procevent.sh handled <source-id> <sequence>` only after fully handling the captured requests.
+On repeated wakes, consult the existing inbox acknowledgement and reply receipts before repeating work.
+Queueing a response is still distinct from transport delivery; an immediate saved receipt does not mean the request was acted on.
+This source remains registered between requests. Do not retire it after answering one note.
 
 For setup, read [the operator guide](../../README.md).
 Enter and leave AFK through Firstmate's existing procedure.
