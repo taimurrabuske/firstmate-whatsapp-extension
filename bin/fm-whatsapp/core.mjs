@@ -9,8 +9,48 @@ export const MAX_TEXT = 3500;
 export const MAX_QUEUE = 100;
 export const MAX_SEEN = 10000;
 export const PREFIX = '[Firstmate] ';
+export const REMOTE_HELP = 'Send your instruction directly—no prefix needed. Shortcuts: status, pending, blocked, decisions, last result, more, help. Quote a Firstmate alert for exact context. Phone messages do not end away mode; decisions still require supervisor handling and normal gates.';
 export const sha256 = value => crypto.createHash('sha256').update(value).digest('hex');
 export const epoch = () => Math.floor(Date.now() / 1000);
+
+// The largest boundary at or before `end` that does not split a UTF-16
+// surrogate pair or a CRLF pair. Never returns `start` or below: a caller with
+// room for a single unit takes the rare split rather than making no progress.
+export function safeBoundaryEnd(text, start, end) {
+  if (end >= text.length) return text.length;
+  if (end - 1 <= start) return end;
+  const a = text.charCodeAt(end - 1), b = text.charCodeAt(end);
+  if ((a >= 0xD800 && a <= 0xDBFF && b >= 0xDC00 && b <= 0xDFFF) || (a === 0x0D && b === 0x0A)) return end - 1;
+  return end;
+}
+
+// Deterministic, lossless splitting into transport-sized parts:
+// chunks.join('') === text, every chunk is <= limit, and no chunk ever ends or
+// begins mid surrogate pair or mid CRLF for any input. Pure function.
+export function chunkText(text, limit) {
+  if (typeof text !== 'string' || !Number.isInteger(limit) || limit < 2) throw new Error('invalid chunk request');
+  if (text.length <= limit) return [text];
+  const chunks = [];
+  for (let start = 0; start < text.length;) {
+    const end = safeBoundaryEnd(text, start, Math.min(text.length, start + limit));
+    chunks.push(text.slice(start, end));
+    start = end;
+  }
+  return chunks;
+}
+
+// Head truncation that leaves no lone surrogate in the surviving text.
+export function truncateText(text, limit) {
+  if (typeof text !== 'string' || !Number.isInteger(limit) || limit < 1) throw new Error('invalid truncate request');
+  return text.length <= limit ? text : text.slice(0, safeBoundaryEnd(text, 0, limit));
+}
+
+// Queue delivery order: durable enqueue sequence, then creation second, then
+// key as the deterministic tie-break. Never filesystem hash order.
+export function outboundOrder(a, b) {
+  return (a.seq ?? 0) - (b.seq ?? 0) || (a.created ?? 0) - (b.created ?? 0) ||
+    (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+}
 
 export function delegateState(home, env = process.env) {
   const canonicalHome = fs.realpathSync(home);
@@ -166,7 +206,7 @@ export class Store {
     }
   }
   enqueue(text, { kind = 'alert', session, id = crypto.randomUUID(), automatic = false, route, requestKey, event,
-    sourceEvents, attachment, fallbackRoute, now = epoch() } = {}) {
+    sourceEvents, attachment, fallbackRoute, part = null, now = epoch() } = {}) {
     if (!validText(text) || !['alert', 'reply'].includes(kind) || typeof session !== 'string') throw new Error('invalid outbound message');
     const queueLock = this.file('queue.lock');
     try { fs.mkdirSync(queueLock, { mode: 0o700 }); }
@@ -176,10 +216,18 @@ export class Store {
       const target = this.file(`outbox/${key}.json`);
       if (readJson(this.file(`sent/${key}.json`)) || readJson(target)) return key;
       if (this.records('outbox').length >= MAX_QUEUE) throw new Error('outbound queue full');
+      // Durable monotonic sequence under the queue lock keeps ordered content
+      // (chunked replies, digest pages) in enqueue order across restarts.
+      const seqFile = this.file('queue-seq.json');
+      let previous = 0;
+      try { const stored = readJson(seqFile); if (Number.isInteger(stored?.n) && stored.n > 0) previous = stored.n; } catch { }
+      const seq = previous + 1;
+      writeJson(seqFile, { n: seq });
       // Independent immutable queue entries permit notify while run holds its process lock.
       const temp = this.file(`outbox/.${crypto.randomUUID()}.tmp`);
-      writeJson(temp, { key, kind, session, text, automatic, route, requestKey, sourceEvents, attachment, fallbackRoute, eventId: id,
-        event: event ? { kind: event.kind, task: event.task, key: event.key } : undefined, created: now, attempts: 0, next: 0,
+      writeJson(temp, { key, kind, session, text, automatic, route, requestKey, sourceEvents, attachment, fallbackRoute,
+        part: part || undefined, eventId: id,
+        event: event ? { kind: event.kind, task: event.task, key: event.key } : undefined, created: now, attempts: 0, next: 0, seq,
         remoteId: `3EB0${crypto.randomBytes(14).toString('hex').toUpperCase()}` });
       try { fs.linkSync(temp, target); }
       catch (error) { if (error.code !== 'EEXIST') throw error; }
@@ -364,10 +412,10 @@ export class Bridge {
           { account: this.identity.account, recipient: (this.peer ?? this.identity).account }))) throw new Error('pending route mismatch');
         if (this.store.records('incoming').length >= MAX_SEEN) throw new Error('incoming receipt limit reached');
         let response;
-        if (job.operation === 'summary') response = String(await (this.summary ? this.summary(job.command) : this.status(job.command))).slice(0, MAX_TEXT);
-        else if (job.operation === 'help') {
-          response = 'Send your instruction directly—no prefix needed. Shortcuts: status, pending, blocked, decisions, last result, more, help. Quote a Firstmate alert for exact context. Phone messages do not end away mode; decisions still require supervisor handling and normal gates.';
-        } else if (job.operation === 'local-reply') response = job.response;
+        if (job.operation === 'summary') response =
+          truncateText(String(await (this.summary ? this.summary(job.command) : this.status(job.command))), MAX_TEXT);
+        else if (job.operation === 'help') response = REMOTE_HELP;
+        else if (job.operation === 'local-reply') response = job.response;
         else if (job.operation === 'note') {
           await this.inbox(job.key, job.body);
           response = `Request ${job.key.slice(0, 12)} received and saved for Firstmate. State: received. Completion requires an explicit Firstmate result.`;
@@ -392,10 +440,21 @@ export class Bridge {
     let gate;
     try { gate = validateSnapshot(await this.events()); this.store.expire(gate, this.clock()); }
     catch { this.problem = 'event source unavailable; alerts remain queued'; gate = { afk: false }; }
-    for (const file of this.store.records('outbox')) {
-      const location = this.store.file(`outbox/${file}`);
-      const job = readJson(location);
-      if (!job || job.next > this.clock()) continue;
+    // Delivery follows durable enqueue order, never outbox filename hash order.
+    const jobs = this.store.records('outbox')
+      .map(name => ({ name, job: readJson(this.store.file(`outbox/${name}`)) }))
+      .filter(entry => entry.job)
+      .sort((a, b) => outboundOrder(a.job, b.job));
+    // A waiting part holds later parts of the same logical message so retries
+    // can never reorder, skip or duplicate a piece; unrelated work continues.
+    const waitingFamilies = new Set();
+    for (const { name, job } of jobs) {
+      if (job.next > this.clock()) {
+        if (job.part?.family) waitingFamilies.add(job.part.family);
+        continue;
+      }
+      if (job.part?.family && waitingFamilies.has(job.part.family)) continue;
+      const location = this.store.file(`outbox/${name}`);
       if (job.route?.transport === 'telegram') continue;
       if (job.kind === 'alert' && (!gate.afk || job.session !== gate.session)) continue;
       if (job.kind === 'alert' && this.notificationPolicy && !this.notificationPolicy.allow(job, gate, this.clock())) continue;
@@ -406,12 +465,12 @@ export class Bridge {
         this.problem = 'delivery receipt limit reached; inspect private state'; this.health(); return;
       }
       // A receipt written before queue deletion recovers without another remote send.
-      if (readJson(this.store.file(`sent/${file}`))) { fs.unlinkSync(location); continue; }
+      if (readJson(this.store.file(`sent/${name}`))) { fs.unlinkSync(location); continue; }
       this.lastSent = this.clock();
       try {
         const delivered = await this.send((this.peer ?? this.identity).account, `${PREFIX}${job.text}`, job.remoteId, job);
         if (!delivered) throw new Error('unconfirmed send');
-        writeJson(this.store.file(`sent/${file}`), { ...job,
+        writeJson(this.store.file(`sent/${name}`), { ...job,
           deliveredRoute: { account: this.identity.account, recipient: (this.peer ?? this.identity).account }, delivered: this.clock() });
         fs.unlinkSync(location);
         this.problem = '';

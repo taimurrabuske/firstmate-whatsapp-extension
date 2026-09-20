@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { canonicalJid, privateDirectory, readJson, sameRoute, sha256, writeJson, MAX_TEXT } from './core.mjs';
+import { canonicalJid, privateDirectory, readJson, sameRoute, sha256, writeJson, truncateText, MAX_TEXT } from './core.mjs';
 import { VOICE_LIMITS } from './voice.mjs';
 
 export const MEDIA_LIMITS = Object.freeze({ image: 8 * 1024 * 1024, document: 15 * 1024 * 1024, voice: 10 * 1024 * 1024,
@@ -222,5 +222,5 @@ export async function authenticatedMediaMessage(message, identity, now, pairedAt
     } else detail = `\n${result?.message || 'Voice transcription returned no usable text.'}`;
   }
   const label = metadata.kind === 'voice' ? 'voice note' : metadata.kind;
-  return { ...metadata, attachment, text: `WhatsApp ${label} received (remote; away mode unchanged).\nLocal attachment: ${attachment.path}\nMIME: ${attachment.mime}; bytes: ${attachment.size}.${detail}`.slice(0, MAX_TEXT) };
+  return { ...metadata, attachment, text: truncateText(`WhatsApp ${label} received (remote; away mode unchanged).\nLocal attachment: ${attachment.path}\nMIME: ${attachment.mime}; bytes: ${attachment.size}.${detail}`, MAX_TEXT) };
 }

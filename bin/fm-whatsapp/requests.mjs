@@ -1,7 +1,7 @@
 // Durable, transport-neutral request lifecycle, bounded context, and summaries.
 import fs from 'node:fs';
 import crypto from 'node:crypto';
-import { privateDirectory, readJson, writeJson, sameRoute, validText } from './core.mjs';
+import { privateDirectory, readJson, writeJson, sameRoute, validText, safeBoundaryEnd, MAX_TEXT } from './core.mjs';
 
 export const REQUEST_STATES = ['received', 'picked-up', 'working', 'waiting', 'completed', 'failed'];
 export const TERMINAL_REQUEST_STATES = ['completed', 'failed'];
@@ -14,7 +14,20 @@ const transitions = {
 };
 const validKey = key => typeof key === 'string' && /^[a-f0-9]{64}$/.test(key);
 const clean = text => text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '').trim();
-const excerpt = (text, limit) => text.length <= limit ? text : `${text.slice(0, Math.floor(limit * 0.7))} … ${text.slice(-(limit - Math.floor(limit * 0.7) - 3))}`;
+// Recorded result and progress text is transport-agnostic journal history; it
+// accepts everything the reply stdin bound (MAX_TEXT * 4 bytes) can carry.
+// Evaluated lazily: core.mjs imports this module during its own load.
+const validRecordedText = text => typeof text === 'string' && text.trim().length > 0 && text.length <= MAX_TEXT * 4 &&
+  !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text);
+const excerpt = (text, limit) => {
+  if (text.length <= limit) return text;
+  const head = text.slice(0, safeBoundaryEnd(text, 0, Math.floor(limit * 0.7)));
+  let tailStart = text.length - (limit - head.length - 3);
+  // Open the tail on the whole character, never mid surrogate pair.
+  if (text.charCodeAt(tailStart) >= 0xDC00 && text.charCodeAt(tailStart) <= 0xDFFF &&
+      text.charCodeAt(tailStart - 1) >= 0xD800 && text.charCodeAt(tailStart - 1) <= 0xDBFF) tailStart -= 1;
+  return `${head} … ${text.slice(tailStart)}`;
+};
 const MAX_PAGE = 3300;
 const routeScope = (route, provenance = route?.transport ?? route?.provenance ?? 'whatsapp') => crypto.createHash('sha256').update(JSON.stringify({
   provenance,
@@ -51,7 +64,7 @@ export class RequestJournal {
     writeJson(file, record); return record;
   }
   transition(key, state, text = '') {
-    if (!REQUEST_STATES.includes(state) || (text && !validText(text))) throw new Error('invalid request progress');
+    if (!REQUEST_STATES.includes(state) || (text && !validRecordedText(text))) throw new Error('invalid request progress');
     const file = this.file(key), record = readJson(file);
     if (!record) throw new Error('unknown request identity');
     if (record.state === state && (!text || record.history.at(-1)?.text === clean(text))) return record;
@@ -100,21 +113,25 @@ export class RequestJournal {
   }
   requestPage(cursor, route) {
     let output = '';
-    while (cursor.index < cursor.keys.length && output.length < MAX_PAGE) {
+    // Loop while two units of room remain: a boundary back-off then always
+    // leaves progress, and no page can end mid surrogate pair or mid CRLF.
+    while (cursor.index < cursor.keys.length && output.length < MAX_PAGE - 1) {
       const record = this.get(cursor.keys[cursor.index]);
       if (!record || (record.routeScope ?? routeScope(record.route, record.provenance)) !== routeScope(route)) {
         cursor.index++; cursor.offset = 0; continue;
       }
-      const row = this.requestRow(record), room = MAX_PAGE - output.length;
-      output += row.slice(cursor.offset, cursor.offset + room);
-      cursor.offset += room;
+      const row = this.requestRow(record);
+      const end = safeBoundaryEnd(row, cursor.offset, Math.min(row.length, cursor.offset + (MAX_PAGE - output.length)));
+      output += row.slice(cursor.offset, end);
+      cursor.offset = end;
       if (cursor.offset >= row.length) { cursor.index++; cursor.offset = 0; if (output.length < MAX_PAGE) output += '\n'; }
     }
     return this.finishPage(cursor, route, output || 'No recorded matching remote requests.');
   }
   textPage(cursor, route) {
-    const output = cursor.text.slice(cursor.offset, cursor.offset + MAX_PAGE) || 'No recorded matching facts.';
-    cursor.offset += Math.min(MAX_PAGE, Math.max(0, cursor.text.length - cursor.offset));
+    const end = safeBoundaryEnd(cursor.text, cursor.offset, Math.min(cursor.text.length, cursor.offset + MAX_PAGE));
+    const output = cursor.text.slice(cursor.offset, end) || 'No recorded matching facts.';
+    cursor.offset = end;
     return this.finishPage(cursor, route, output);
   }
   finishPage(cursor, route, output) {

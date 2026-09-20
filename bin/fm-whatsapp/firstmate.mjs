@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
-import { privateDirectory, readJson, writeJson, sha256, sameRoute, epoch, validText } from './core.mjs';
+import { privateDirectory, readJson, writeJson, sha256, sameRoute, epoch, validText, chunkText, MAX_TEXT } from './core.mjs';
 import { RequestJournal, REQUEST_STATES } from './requests.mjs';
 
 export function execute(file, args, { env, input } = {}) {
@@ -162,7 +162,12 @@ export class FirstmateAdapter {
   }
   reply(key, text) {
     if (!/^[a-f0-9]{64}$/.test(key)) throw new Error('invalid transport message identity');
-    if (!validText(text)) throw new Error('invalid reply text');
+    // Size is the chunker's concern below; content validity is not. The bound
+    // matches the reply stdin byte cap so validation never follows queueing.
+    if (typeof text !== 'string' || !text.trim() || text.length > MAX_TEXT * 4 ||
+        /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text)) {
+      throw new Error('invalid reply text');
+    }
     text = text.trim();
     const { current, receipt } = this.requestReceipt(key);
     const request = this.requests.get(key);
@@ -170,8 +175,19 @@ export class FirstmateAdapter {
     if (request?.state === 'completed' && request.history.at(-1)?.text !== text.trim()) {
       throw new Error('request already completed with a different result');
     }
-    const queued = this.store.enqueue(text, { kind: 'reply', session: '', route: current, requestKey: key,
-      fallbackRoute: receipt.fallbackRoute, id: `response:${key}:${sha256(text)}` });
+    // Long results split deterministically into ordered transport-sized parts.
+    // Each part's queue identity is a pure function of (key, full text, part
+    // index), so replaying the same reply re-deduplicates instead of duplicating.
+    const digest = sha256(text);
+    const parts = chunkText(text, MAX_TEXT);
+    const family = `${key}:${digest}`;
+    let queued;
+    for (const [index, part] of parts.entries()) {
+      queued = this.store.enqueue(part, { kind: 'reply', session: '', route: current, requestKey: key,
+        fallbackRoute: receipt.fallbackRoute,
+        id: parts.length === 1 ? `response:${key}:${digest}` : `response:${key}:${digest}:${index + 1}of${parts.length}`,
+        part: parts.length === 1 ? null : { family, index: index + 1, count: parts.length } });
+    }
     if (request && request.state !== 'completed') this.requests.transition(key, 'completed', text);
     return queued;
   }

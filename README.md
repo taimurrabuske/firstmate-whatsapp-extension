@@ -173,6 +173,7 @@ printf '%s\n' 'The simulation finished; the result meets the stated target.' |
 It refuses unknown message keys, uncertain handoffs, and route changes.
 Identical responses to the same request are deduplicated. For acknowledgement and progress, use `progress MESSAGE_KEY picked-up|working|waiting|failed` with detail on stdin. Use `reply` for the successful final result. Use `reply-file MESSAGE_KEY /absolute/report.pdf` to attach a requested report or plot, followed by the final text reply.
 Use `notify` for proactive messages during confirmed AFK sessions.
+A result longer than one transport message is split deterministically into ordered, size-bounded parts on whole-character (never surrogate-pair or CRLF) boundaries; each part keeps a stable identity, so retries never duplicate, skip, or reorder a piece, and identical replays still deduplicate.
 
 Ordinary help/status/receipt replies work while the bridge is running, including outside AFK.
 Automatic notices cover current decisions and new completion/failure/progress records for tasks that still have local metadata. The first observation of an AFK session suppresses historical outcomes. Fleet status and remote request lifecycle are separate views.
@@ -189,6 +190,7 @@ WhatsApp remains the primary transport. Telegram makes no network requests until
 Start a private conversation with your bot from that user. Only that exact user/private chat is accepted; groups, forwarded messages, and other users are ignored. The token never belongs in chat, command arguments, Git, or logs. Telegram accepts text requests and the same summaries/preferences, and can return text or requested report files. Incoming voice/media currently use WhatsApp.
 
 After a two-minute WhatsApp outage, newly queued responses with an explicitly bound Telegram fallback may be delivered there. Older unbound messages are held on their original route. Pairing or token changes cannot redirect old replies to a new recipient. Telegram continues running when WhatsApp requires re-pairing, provided the bridge already has an authenticated WhatsApp identity.
+Outbound delivery on both transports follows enqueue order (durable sequence, never filesystem hash order), so multi-part results and digest pages arrive in order across restarts and retries.
 That keep-alive decision reads only the durable local Telegram configuration, so a transiently unreadable token file cannot stop a configured fallback; failed deliveries are reported and retried instead. Proactive fallback alerts retain all AFK and preference gates. Telegram's server receipt does not prove human readership; a crash after a send but before its local receipt can duplicate a message. No paid messaging feature is used. Telegram is **not activated** by installing the addon.
 
 ## Private state and lifecycle

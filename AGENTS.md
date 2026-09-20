@@ -12,6 +12,10 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 `bin/fm-whatsapp/cli.mjs` exports only small helpers; its `main()` self-starts when `process.argv[1]` is the cli path. To test the real `run` lifecycle (QR, reconnect, Telegram fallback), use `bin/fm-whatsapp/test/cli-lifecycle.test.mjs`, which spawns `test/cli-lifecycle-driver.mjs` under `node --experimental-test-module-mocks`: the driver registers `mock.module` fakes for `@whiskeysockets/baileys` and `qrcode-terminal`, sets `process.argv` before importing the cli, drives socket events on a timeline, and reports a `DRIVER_RESULT` JSON line through a synchronous stderr write in a process `exit` hook (the CLI calls `process.exit` itself, which truncates buffered stdout).
 
+## Size boundaries and delivery ordering
+
+Transport sizing and ordering primitives live in `bin/fm-whatsapp/core.mjs`: `chunkText`/`truncateText`/`safeBoundaryEnd` are the only sanctioned way to cut text at a size boundary (never split surrogate pairs or CRLF, lossless by construction), and outbox delivery order is the durable `seq` stamped under the queue lock, read via `outboundOrder` — never outbox filename (hash) order. Multi-part replies share a `part.family`; a waiting part holds later parts in both `Bridge.flush` and the Telegram fallback. `requests.mjs` imports from `core.mjs` while `core.mjs` imports `RequestJournal`, so module-load-time use of core constants in `requests.mjs` must stay lazy (TDZ).
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.

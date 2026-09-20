@@ -1,7 +1,8 @@
 // Optional, explicitly paired fallback. Tokens never enter queues or diagnostics.
 import fs from 'node:fs';
 import path from 'node:path';
-import { readJson, writeJson, privateDirectory, sha256, epoch, validText, parseRequest, PREFIX, sameRoute } from './core.mjs';
+import { readJson, writeJson, privateDirectory, sha256, epoch, validText, parseRequest, PREFIX, sameRoute,
+  truncateText, outboundOrder, REMOTE_HELP } from './core.mjs';
 
 function tokenAt(file) {
   if (!path.isAbsolute(file)) throw new Error('Telegram token file must be absolute');
@@ -73,7 +74,7 @@ export class TelegramClient {
           typeof attachment.name !== 'string' || path.basename(attachment.name) !== attachment.name || /[\x00-\x1f]/.test(attachment.name)) throw new Error('invalid Telegram attachment');
       const body = new FormData();
       body.set('chat_id', this.config.chatId);
-      body.set('caption', text.slice(0, 1024));
+      body.set('caption', truncateText(text, 1024));
       body.set('document', new Blob([attachment.data], { type: attachment.mime }), attachment.name);
       result = await this.call('sendDocument', body);
     } else result = await this.call('sendMessage', { chat_id: this.config.chatId, text, link_preview_options: { is_disabled: true } });
@@ -175,7 +176,7 @@ export class TelegramDelegate {
           await this.adapter.note(job.key, job.body);
           response = `Received request ${job.key.slice(0, 8)}. Waiting for Firstmate to pick it up.`;
         } else if (response == null) {
-          response = request.operation === 'help' ? 'Send your request directly. Shortcuts: status, pending, blocked, decisions, last result, more.' :
+          response = request.operation === 'help' ? REMOTE_HELP :
             await (this.adapter.summary ? this.adapter.summary(request.command ?? request.operation) : this.adapter.status());
         }
         job.response = response; writeJson(file, job);
@@ -191,9 +192,19 @@ export class TelegramDelegate {
       const offline = readJson(offlineFile, { since: this.clock() });
       if (whatsapp.connected) offline.since = this.clock();
       writeJson(offlineFile, offline);
-      for (const name of this.store.records('outbox')) {
-        const file = this.store.file(`outbox/${name}`), job = readJson(file);
-        if (job.next > this.clock()) continue;
+      // Fallback delivery follows durable enqueue order, never hash order.
+      const jobs = this.store.records('outbox')
+        .map(name => ({ name, job: readJson(this.store.file(`outbox/${name}`)) }))
+        .filter(entry => entry.job)
+        .sort((a, b) => outboundOrder(a.job, b.job));
+      const waitingFamilies = new Set();
+      for (const { name, job } of jobs) {
+        if (job.next > this.clock()) {
+          if (job.part?.family) waitingFamilies.add(job.part.family);
+          continue;
+        }
+        if (job.part?.family && waitingFamilies.has(job.part.family)) continue;
+        const file = this.store.file(`outbox/${name}`);
         const direct = job.route?.transport === 'telegram';
         if (direct ? !sameRoute(job.route, config.route) :
           (whatsapp.connected || this.clock() - offline.since < config.fallbackAfterSeconds ||
