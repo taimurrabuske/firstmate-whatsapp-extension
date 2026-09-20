@@ -118,11 +118,11 @@ test('explicit progress is durable, transition-checked, and reply is the only fi
     binding: { home: fs.realpathSync(f.home), codeRoot: path.resolve(f.options.codeRoot), state: path.resolve(f.options.state) } });
   assert.equal(adapter.progress(key, 'working', 'Running recorded checks.').state, 'working');
   assert.throws(() => adapter.progress(key, 'received'), /use reply/);
-  assert.throws(() => adapter.progress(key, 'picked-up'), /invalid request transition/);
+  assert.equal(adapter.progress(key, 'picked-up', 'Owner explicitly resumed it.').state, 'picked-up');
   adapter.reply(key, 'Checks passed.');
   assert.equal(adapter.requests.get(key).state, 'completed');
   assert.throws(() => adapter.progress(key, 'waiting'), /invalid request transition/);
-  assert.equal(f.store.records('outbox').length, 2);
+  assert.equal(f.store.records('outbox').length, 3);
 });
 
 test('maintenance only re-rings an existing stale note with a strict bound and records handled evidence', async t => {
@@ -132,26 +132,76 @@ test('maintenance only re-rings an existing stale note with a strict bound and r
   adapter.requests.receive(key, { route, text: 'do not duplicate' });
   const body = adapter.envelope(key, 'do not duplicate'); saveNote(f, body, 'note-1');
   writeJson(f.store.file(`handoffs/${key}.json`), { id: 'note-1', body, phase: 'saved', route, created: 1,
+    binding: { home: fs.realpathSync(f.home), codeRoot: path.resolve(f.options.codeRoot), state: path.resolve(f.options.state) },
     maintenance: { rings: 0, last: 0 } });
+  const foreignKey = 'f'.repeat(64);
+  writeJson(f.store.file(`handoffs/${foreignKey}.json`), { id: 'telegram-note', body: 'foreign', phase: 'saved',
+    route: { account: route.account, recipient: 'telegram-recipient' }, created: 1, maintenance: { rings: 0, last: 0 } });
   await adapter.maintain({ now: 1000, staleAfter: 10, maxRings: 1 });
   assert.equal(calls.length, 1); assert.equal(calls[0].file, '/bin/bash');
+  assert.equal(readJson(f.store.file(`handoffs/${foreignKey}.json`)).maintenance.rings, 0);
   const report = await adapter.maintain({ now: 2000, staleAfter: 10, maxRings: 1 });
-  assert.equal(calls.length, 1); assert.equal(report[0].evidence, 'controller watcher stale');
+  assert.equal(calls.length, 1); assert.equal(report[0].evidence, 'controller has not acknowledged; watcher beacon is unavailable');
+  assert.match(report[0].dedupeId, /^maintenance:/);
+  adapter.notifyMaintenance(report[0]); adapter.notifyMaintenance(report[0]);
+  assert.equal(f.store.records('outbox').length, 1);
   fs.mkdirSync(path.join(f.home, 'state/inbox/handled'));
   fs.renameSync(path.join(f.home, 'state/inbox/note-1.note'), path.join(f.home, 'state/inbox/handled/note-1.note'));
   await adapter.maintain({ now: 3000, staleAfter: 10, maxRings: 1 });
   assert.equal(adapter.requests.get(key).state, 'waiting'); // Inbox handling is not evidence that stalled work resumed.
 });
 
-test('request summaries paginate recorded facts without silently truncating', t => {
+test('read-only decision helper works without AFK or extension enablement', t => {
+  const f = fixture(t), code = path.join(f.base, 'decision-code'), bin = path.join(code, 'bin');
+  fs.mkdirSync(bin, { recursive: true }); fs.mkdirSync(f.options.state, { recursive: true });
+  fs.writeFileSync(path.join(f.options.state, 'worker.meta'), 'kind=worker\n');
+  fs.writeFileSync(path.join(f.options.state, 'worker.status'), 'opaque fixture\n');
+  fs.writeFileSync(path.join(bin, 'fm-afk-contract.sh'), "status_open_decisions() { printf 'gate\\tneeds-decision\\tChoose safely\\n'; }\n");
+  const result = spawnSync(path.join(root, 'bin/fm-whatsapp-decisions.sh'), ['--json'], { encoding: 'utf8',
+    env: { ...process.env, FM_HOME: f.home, FM_CODE_ROOT: code, FM_STATE_OVERRIDE: f.options.state } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout).decisions, [{ task: 'worker', key: 'gate', text: 'Choose safely' }]);
+});
+
+test('decision summary uses AFK-independent recorded decision reader', async t => {
   const f = fixture(t), route = { account: '15555550123@s.whatsapp.net', recipient: '15555550123@s.whatsapp.net' };
   writeJson(f.store.file('identity.json'), { account: route.account, pairedAt: 1 });
+  const calls = [];
+  const adapter = new FirstmateAdapter({ ...f.options, run: async file => { calls.push(file);
+    return JSON.stringify({ schema: 'fm-whatsapp-decisions.v1', decisions: [{ task: 'build', key: 'gate', text: 'Choose safely' }] });
+  } });
+  assert.match(await adapter.summary('decisions'), /build\/gate/);
+  assert.ok(calls[0].endsWith('fm-whatsapp-decisions.sh'));
+  assert.ok(!calls[0].endsWith('fm-whatsapp-events.sh'));
+});
+
+test('watcher diagnosis uses beacon evidence and otherwise reports unknown', t => {
+  const f = fixture(t), adapter = new FirstmateAdapter({ ...f.options, run: async () => '' });
+  assert.equal(adapter.watcherEvidence(1000, 300).code, 'watcher-unknown');
+  const beat = path.join(f.options.state, '.last-watcher-beat'); fs.mkdirSync(f.options.state, { recursive: true });
+  fs.writeFileSync(beat, ''); fs.utimesSync(beat, 100, 100);
+  assert.equal(adapter.watcherEvidence(1000, 300).code, 'watcher-stale');
+  fs.utimesSync(beat, 900, 900);
+  assert.equal(adapter.watcherEvidence(1000, 300).code, 'unacknowledged');
+});
+
+test('request summaries preserve query and complete content across route-bound pages', t => {
+  const f = fixture(t), route = { account: '15555550123@s.whatsapp.net', recipient: '15555550123@s.whatsapp.net', provenance: 'whatsapp' };
+  writeJson(f.store.file('identity.json'), { account: route.account, pairedAt: 1 });
   const adapter = new FirstmateAdapter({ ...f.options, run: async () => '' });
-  for (let i = 0; i < 10; i++) adapter.requests.receive(sha256(`request-${i}`), { route, text: `request ${i}` });
-  const first = adapter.requests.summarize('pending', route);
-  assert.match(first, /Send more for 2 more/);
-  const rest = adapter.requests.summarize('more', route);
-  assert.equal(rest.split('\n').length, 2);
+  const marker = 'FINAL-END-MARKER';
+  for (let i = 0; i < 6; i++) adapter.requests.receive(sha256(`request-${i}`), { route, text: `request ${i} ${'x'.repeat(900)}` });
+  const done = sha256('request-0'); adapter.requests.transition(done, 'working', 'checking');
+  adapter.requests.transition(done, 'completed', `${'z'.repeat(3400 - marker.length)}${marker}`);
+  let page = adapter.requests.summarize('pending', route), combined = page;
+  assert.ok(page.length <= 3500); assert.ok(!page.includes('lifecycle state: completed'));
+  while (page.includes('Send more')) { page = adapter.requests.summarize('more', route); assert.ok(page.length <= 3500); combined += page; }
+  assert.ok(!combined.includes(marker)); // The pending cursor never resets to all records.
+  page = adapter.requests.summarize('last result', route); combined = page;
+  while (page.includes('Send more')) { page = adapter.requests.summarize('more', route); combined += page; }
+  assert.ok(combined.includes(marker));
+  const other = { ...route, credentialFingerprint: 'other-credential' };
+  assert.match(adapter.requests.summarize('more', other), /No additional/);
 });
 
 test('existing real Firstmate inbox integration in an isolated home', { skip: !process.env.FM_TEST_CODE_ROOT }, async t => {

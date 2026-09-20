@@ -310,10 +310,10 @@ export class Bridge {
           decision = { task: quoted.event.task, key: quoted.event.key, eventId: quoted.eventId };
         }
         const quoteContext = quoteMatches ? `\nPersisted quoted Firstmate message: ${quoted.text}\n` : '\n';
-        const recent = !quoteMatches ? this.requests.recentContext(route, { exclude: incoming.key }).map(x => `${x.key}:${x.state}`).join(', ') : '';
+        const recent = !quoteMatches ? this.requests.recentContext(route, { exclude: incoming.key }) : '';
         body = `Remote request ID: ${incoming.key}\nWhatsApp phone note (remote; remain away).${quoteContext}` +
           (decision ? `Exact recorded decision context: task=${decision.task} key=${decision.key}. Route through Firstmate's normal decision handling.\n` : '') +
-          (recent ? `Related open request IDs on this exact route (context only): ${recent}\n` : '') + `\n${request.text}`;
+          (recent ? `Bounded recent conversation on this exact authenticated route (context only):\n${recent}\n` : '') + `\n${request.text}`;
         this.requests.receive(incoming.key, { route, text: request.text, quoted: quoteMatches ? quoted.requestKey ?? quoted.eventId : null, decision });
       }
       writeJson(file, { key: incoming.key, account: this.identity.account, route,

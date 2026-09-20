@@ -159,11 +159,25 @@ export class FirstmateAdapter {
       requestKey: key, id: `progress:${key}:${record.updated}:${state}:${sha256(text)}` });
     return record;
   }
+  watcherEvidence(now, staleAfter) {
+    const beat = path.join(this.state, '.last-watcher-beat');
+    try {
+      const stat = fs.lstatSync(beat);
+      if (!stat.isFile() || stat.isSymbolicLink()) return { code: 'watcher-unknown', text: 'controller has not acknowledged; watcher state unknown' };
+      const age = Math.max(0, now - Math.floor(stat.mtimeMs / 1000));
+      return age >= staleAfter
+        ? { code: 'watcher-stale', text: `controller has not acknowledged; watcher beacon is ${age}s old` }
+        : { code: 'unacknowledged', text: `controller has not acknowledged; watcher beacon is fresh (${age}s old)` };
+    } catch (error) {
+      if (error.code === 'ENOENT') return { code: 'watcher-unknown', text: 'controller has not acknowledged; watcher beacon is unavailable' };
+      return { code: 'watcher-unknown', text: 'controller has not acknowledged; watcher state unknown' };
+    }
+  }
   async maintain({ now = epoch(), staleAfter = 300, maxRings = 3 } = {}) {
-    const reports = [];
+    const reports = [], current = this.store.currentRoute();
     for (const name of fs.readdirSync(this.store.file('handoffs')).filter(x => /^[a-f0-9]{64}\.json$/.test(x))) {
       const file = this.store.file(`handoffs/${name}`), receipt = readJson(file);
-      if (!receipt?.id || !['saved', 'handled'].includes(receipt.phase)) continue;
+      if (!receipt?.id || !['saved', 'handled'].includes(receipt.phase) || !sameRoute(receipt.route, current)) continue;
       const found = this.findNote(name.slice(0, -5), receipt.body);
       if (found?.handled) {
         if (receipt.phase !== 'handled') { receipt.phase = 'handled'; writeJson(file, receipt); }
@@ -179,26 +193,36 @@ export class FirstmateAdapter {
         if (request && request.state !== 'waiting' && !['completed', 'failed'].includes(request.state))
           this.requests.transition(requestKey, 'waiting', evidence);
       };
-      if (maintenance.rings >= maxRings) { markWaiting('Controller watcher stale.');
-        reports.push({ key: requestKey, state: 'waiting', evidence: 'controller watcher stale' }); continue; }
+      const evidence = this.watcherEvidence(now, staleAfter);
+      const report = (code, text) => ({ key: requestKey, state: 'waiting', evidence: text,
+        code, dedupeId: `maintenance:${requestKey}:${code}`, text: `Request ${requestKey.slice(0, 12)} waiting: ${text}.` });
+      if (maintenance.rings >= maxRings) { markWaiting(evidence.text); reports.push(report(evidence.code, evidence.text)); continue; }
       // Re-ring the exact existing inbox identity only. Never publish or execute the request again.
       try { await this.ring(receipt.id); maintenance.rings++; maintenance.last = now; receipt.maintenance = maintenance; writeJson(file, receipt);
-        markWaiting('Existing note re-rung; awaiting controller.');
-        reports.push({ key: requestKey, state: 'waiting', evidence: 'existing note re-rung' }); }
-      catch { markWaiting('Controller watcher busy.'); reports.push({ key: requestKey, state: 'waiting', evidence: 'controller watcher busy' }); }
+        markWaiting(evidence.text); reports.push(report(evidence.code, evidence.text)); }
+      catch { const text = 'wake failed; controller state unknown'; markWaiting(text); reports.push(report('wake-failed', text)); }
     }
     return reports;
   }
+  notifyMaintenance(report) {
+    if (!report || !/^[a-f0-9]{64}$/.test(report.key) || typeof report.dedupeId !== 'string' || !validText(report.text))
+      throw new Error('invalid maintenance report');
+    const { current } = this.requestReceipt(report.key);
+    return this.store.enqueue(report.text, { kind: 'reply', session: '', route: current, requestKey: report.key,
+      id: report.dedupeId });
+  }
   async summary(command = 'status') {
-    const route = this.store.currentRoute();
+    const route = { ...this.store.currentRoute(), provenance: 'whatsapp' };
     if (command === 'status') {
       const rows = this.requests.list(route), open = rows.filter(x => !['completed', 'failed'].includes(x.state));
-      return `${open.length} open request(s), ${rows.length} recorded. ${String(await this.status()).trim()}`.slice(0, 3500);
+      const text = `Remote request lifecycle: ${open.length} open, ${rows.length} recorded.\n` +
+        `Firstmate recorded fleet status (separate from remote request lifecycle):\n${String(await this.status()).trim()}`;
+      return this.requests.paginateText('status', route, text);
     }
     if (command === 'decisions') {
-      const snapshot = await this.events();
-      const decisions = snapshot.events.filter(x => x.kind === 'decision' || (x.task && x.key));
-      return decisions.length ? decisions.map(x => `${x.task}/${x.key}: ${x.text}`).join('\n').slice(0, 3500) : 'No recorded open decisions.';
+      const snapshot = await this.decisions();
+      const text = snapshot.decisions.length ? snapshot.decisions.map(x => `${x.task}/${x.key}: ${x.text}`).join('\n') : 'No recorded open decisions.';
+      return this.requests.paginateText('decisions', route, text);
     }
     return this.requests.summarize(command, route);
   }
@@ -207,5 +231,10 @@ export class FirstmateAdapter {
   }
   async events() {
     return JSON.parse(await this.run(path.join(this.extensionRoot, 'bin/fm-whatsapp-events.sh'), ['--json'], { env: this.env }));
+  }
+  async decisions() {
+    const value = JSON.parse(await this.run(path.join(this.extensionRoot, 'bin/fm-whatsapp-decisions.sh'), ['--json'], { env: this.env }));
+    if (value?.schema !== 'fm-whatsapp-decisions.v1' || !Array.isArray(value.decisions)) throw new Error('invalid decision projection');
+    return value;
   }
 }

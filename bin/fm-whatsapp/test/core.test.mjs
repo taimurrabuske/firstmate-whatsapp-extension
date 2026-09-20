@@ -196,12 +196,16 @@ test('request lifecycle is durable, contextual followups stay on route, and rece
   assert.equal(readJson(f.store.file(`requests/${first}.json`)).state, 'received');
   assert.ok(f.store.records('outbox').map(x => readJson(f.store.file(`outbox/${x}`)).text)
     .some(text => text.includes(first.slice(0, 12)) && !/completed/i.test(text)));
+  f.bridge.requests.transition(first, 'working', 'Found the second issue in parser output.');
+  f.bridge.requests.transition(first, 'completed', 'The second issue was a bounded parser mismatch.');
   const restarted = new Bridge({ store: new Store(f.home, f.state), clock: () => 1010,
     inbox: async (key, text) => f.calls.inbox.push({ key, text }), status: async () => 'status',
     events: async () => f.snapshot, send: async () => true });
   restarted.connect(user);
   await restarted.receive(batch(message('also inspect its logs', { id: 'LIFE2' })));
   assert.match(f.calls.inbox.at(-1).text, new RegExp(first));
+  assert.match(f.calls.inbox.at(-1).text, /bounded parser mismatch/);
+  assert.match(f.calls.inbox.at(-1).text, /start a long check/);
   restarted.peer = { account: '15555550999@s.whatsapp.net', aliases: ['15555550999@s.whatsapp.net'] };
   const remote = message('different route', { id: 'ROUTE2', remoteJid: restarted.peer.account, fromMe: false });
   await restarted.receive(batch(remote));
