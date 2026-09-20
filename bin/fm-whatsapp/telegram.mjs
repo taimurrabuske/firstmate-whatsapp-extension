@@ -28,6 +28,16 @@ export function telegramConfig(store) {
   return { ...config, token, route: { transport: 'telegram', account: `telegram:${token.split(':')[0]}`,
     recipient: `telegram:${config.chatId}`, credentialDigest: sha256(token) } };
 }
+// Whether a fallback is explicitly configured, decided without reading the token
+// file. Lifecycle keep-alive decisions use this so a transiently unreadable
+// token cannot stop a configured fallback; delivery and its recovery remain the
+// tick's concern, which already reports and retries such failures.
+export function telegramConfigured(store) {
+  try {
+    const config = readJson(store.file('telegram.json'));
+    return Boolean(config && config.enabled !== false);
+  } catch { return false; }
+}
 export function telegramStore(store) {
   const scoped = Object.create(store);
   scoped.currentRoute = () => {

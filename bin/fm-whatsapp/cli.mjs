@@ -8,7 +8,7 @@ import { NotificationPolicy } from './notifications.mjs';
 import { stageAttachment, outboundContent, attachmentBytes } from './media.mjs';
 import { loadVoiceConfig, transcribeVoice } from './voice.mjs';
 import { MediaIntake } from './media-intake.mjs';
-import { TelegramDelegate, telegramStore, telegramConfig, configureTelegram } from './telegram.mjs';
+import { TelegramDelegate, telegramStore, telegramConfig, telegramConfigured, configureTelegram } from './telegram.mjs';
 import { Acknowledgements, Bridge, Store, readJson, writeJson, delegateState, verifyHomeBinding, ownIdentity, canonicalJid, authenticatedMessage, validText, parseRequest, epoch, MAX_TEXT, validateSnapshot } from './core.mjs';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const help = `Usage: FM_HOME=/absolute/home bin/fm-whatsapp.sh <command>
@@ -308,7 +308,10 @@ async function main(argv) {
         if (update.connection) currentState = update.connection;
         if (update.qr) {
           if (command !== 'pair') {
-            if (optionalTelegram()) bridge.disconnect('WhatsApp pairing required; Telegram fallback enabled');
+            // Decided without the token file: a transiently unreadable token is
+            // the tick's degraded-and-retried condition, never a reason to stop
+            // a run whose explicitly configured fallback must stay serviced.
+            if (telegramConfigured(store)) bridge.disconnect('WhatsApp pairing required; Telegram fallback enabled');
             else stop('pairing required');
             return;
           }
@@ -354,7 +357,7 @@ async function main(argv) {
           bridge.disconnect('disconnected; reconnect pending');
           const code = update.lastDisconnect?.error?.output?.statusCode;
           if (connectionDisposition(code, DisconnectReason) === 'stop') {
-            if (command === 'run' && optionalTelegram()) {
+            if (command === 'run' && telegramConfigured(store)) {
               log('WhatsApp requires pairing; optional Telegram remains available');
               bridge.disconnect('WhatsApp login required; Telegram fallback enabled');
             } else {
