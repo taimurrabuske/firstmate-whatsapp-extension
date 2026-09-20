@@ -6,7 +6,10 @@ import { execFile } from 'node:child_process';
 import { privateDirectory, readJson } from './core.mjs';
 
 export const VOICE_CONFIG_SCHEMA = 'fm-whatsapp-voice.v1';
+export const VOICE_LIMITS = Object.freeze({ maxSeconds: 1_800, decodeTimeoutMs: 300_000, transcribeTimeoutMs: 1_800_000 });
 const MAX_TRANSCRIPT = 12_000;
+// Mono 16-bit PCM at 16 kHz is 32,000 bytes per second; allow header and container slack.
+const MAX_WAV_BYTES = VOICE_LIMITS.maxSeconds * 32_000 + 65_536;
 
 function safeRegular(file, executable = false) {
   if (typeof file !== 'string' || !path.isAbsolute(file)) return false;
@@ -48,7 +51,7 @@ export function runProgram(file, args, { timeout = 60_000, maxBuffer = 128 * 102
 }
 
 /** Always resolves with an intelligible result. Temporary audio/transcripts are removed on every path. */
-export async function transcribeVoice(input, { store, config, run = runProgram, timeoutMs = 60_000 } = {}) {
+export async function transcribeVoice(input, { store, config, run = runProgram, timeoutMs = 2_100_000 } = {}) {
   const setup = config ?? (store ? loadVoiceConfig(store) : null);
   if (!setup?.available) return { available: false, message: setup?.message || 'Voice transcription is unavailable; offline runtime is not configured.' };
   if (!safeRegular(input)) return { available: false, message: 'Voice transcription failed: the saved voice note is unavailable.' };
@@ -59,10 +62,11 @@ export async function transcribeVoice(input, { store, config, run = runProgram, 
   const wav = path.join(work, 'audio.wav'), output = path.join(work, 'transcript');
   try {
     await run(setup.ffmpeg, ['-nostdin', '-hide_banner', '-loglevel', 'error', '-i', input, '-vn', '-ac', '1', '-ar', '16000',
-      '-t', '300', '-f', 'wav', wav], { timeout: Math.min(timeoutMs, 60_000), maxBuffer: 128 * 1024 });
-    if (!safeRegular(wav) || fs.statSync(wav).size > 20 * 1024 * 1024) throw new Error('invalid decoded audio');
+      '-t', String(VOICE_LIMITS.maxSeconds), '-f', 'wav', wav],
+      { timeout: Math.min(timeoutMs, VOICE_LIMITS.decodeTimeoutMs), maxBuffer: 128 * 1024 });
+    if (!safeRegular(wav) || fs.statSync(wav).size > MAX_WAV_BYTES) throw new Error('invalid decoded audio');
     await run(setup.whisper, ['-m', setup.model, '-f', wav, '-l', setup.language, '-otxt', '-of', output, '--no-prints'],
-      { timeout: Math.min(timeoutMs, 180_000), maxBuffer: 128 * 1024 });
+      { timeout: Math.min(timeoutMs, VOICE_LIMITS.transcribeTimeoutMs), maxBuffer: 128 * 1024 });
     const transcript = `${output}.txt`;
     if (!safeRegular(transcript)) throw new Error('missing transcript');
     const stat = fs.statSync(transcript);

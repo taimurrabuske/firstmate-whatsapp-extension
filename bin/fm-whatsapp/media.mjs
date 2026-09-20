@@ -4,9 +4,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { canonicalJid, privateDirectory, readJson, sameRoute, sha256, writeJson, MAX_TEXT } from './core.mjs';
+import { VOICE_LIMITS } from './voice.mjs';
 
 export const MEDIA_LIMITS = Object.freeze({ image: 8 * 1024 * 1024, document: 15 * 1024 * 1024, voice: 10 * 1024 * 1024,
-  voiceSeconds: 300, name: 120 });
+  voiceSeconds: VOICE_LIMITS.maxSeconds, name: 120 });
 const MIME = Object.freeze({
   '.jpg': ['image', 'image/jpeg'], '.jpeg': ['image', 'image/jpeg'], '.png': ['image', 'image/png'], '.webp': ['image', 'image/webp'],
   '.pdf': ['document', 'application/pdf'], '.txt': ['document', 'text/plain'], '.csv': ['document', 'text/csv'],

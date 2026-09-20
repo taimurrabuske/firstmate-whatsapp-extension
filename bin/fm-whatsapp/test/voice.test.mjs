@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Store, writeJson } from '../core.mjs';
-import { loadVoiceConfig, transcribeVoice, VOICE_CONFIG_SCHEMA } from '../voice.mjs';
+import { loadVoiceConfig, transcribeVoice, VOICE_CONFIG_SCHEMA, VOICE_LIMITS } from '../voice.mjs';
 
 function fixture(t) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'fm-voice-test-'));
@@ -72,4 +72,45 @@ test('oversized, missing and control-character transcripts fail closed', async t
     assert.equal(result.available, false);
     assert.deepEqual(fs.readdirSync(f.store.file('voice-tmp')), []);
   }
+});
+
+test('a full thirty-minute note is accepted with raised decode cap and runtime bounds', async t => {
+  const f = fixture(t), calls = [];
+  const config = { available: true, ffmpeg: f.ffmpeg, whisper: f.whisper, model: f.model, language: 'en' };
+  const run = async (file, args, options) => {
+    calls.push({ file, args, options });
+    if (file === f.ffmpeg) {
+      // Sparse file sized like a real full-length decode: 44-byte WAV header plus 16 kHz mono 16-bit PCM.
+      const wav = args.at(-1);
+      fs.writeFileSync(wav, 'RIFF');
+      fs.truncateSync(wav, VOICE_LIMITS.maxSeconds * 32_000 + 44);
+    } else {
+      const prefix = args[args.indexOf('-of') + 1]; fs.writeFileSync(`${prefix}.txt`, 'thirty minute transcript\n');
+    }
+    return { stdout: '', stderr: '' };
+  };
+  const result = await transcribeVoice(f.input, { store: f.store, config, run });
+  assert.deepEqual(result, { available: true, text: 'thirty minute transcript' });
+  assert.equal(calls[0].args[calls[0].args.indexOf('-t') + 1], '1800');
+  assert.equal(calls[0].options.timeout, VOICE_LIMITS.decodeTimeoutMs);
+  assert.equal(calls[1].options.timeout, VOICE_LIMITS.transcribeTimeoutMs);
+  assert.deepEqual(fs.readdirSync(f.store.file('voice-tmp')), []);
+});
+
+test('decoded audio beyond the thirty-minute bound fails closed and cleans temporaries', async t => {
+  const f = fixture(t);
+  const config = { available: true, ffmpeg: f.ffmpeg, whisper: f.whisper, model: f.model, language: 'en' };
+  let whisperCalls = 0;
+  const result = await transcribeVoice(f.input, { store: f.store, config, run: async (file, args) => {
+    if (file === f.ffmpeg) {
+      // Sparse file twice the size of a full-length decode: over any sane cap for the accepted duration.
+      const wav = args.at(-1);
+      fs.writeFileSync(wav, 'RIFF');
+      fs.truncateSync(wav, VOICE_LIMITS.maxSeconds * 32_000 * 2);
+    } else whisperCalls++;
+    return { stdout: '', stderr: '' };
+  } });
+  assert.equal(result.available, false); assert.match(result.message, /failed locally/);
+  assert.equal(whisperCalls, 0);
+  assert.deepEqual(fs.readdirSync(f.store.file('voice-tmp')), []);
 });
