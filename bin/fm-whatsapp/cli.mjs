@@ -148,6 +148,9 @@ async function main(argv) {
   const onSignal = () => stop('stopped');
   process.once('SIGINT', onSignal); process.once('SIGTERM', onSignal);
   try {
+    // libsignal bypasses the configured Baileys logger and can print key material.
+    // Our own diagnostics use explicit sanitized process.stderr writes below.
+    for (const method of ['log', 'info', 'warn', 'error', 'debug', 'trace']) console[method] = () => {};
     let makeWASocket, useMultiFileAuthState, DisconnectReason, qr, QRCode, qrLevel;
     try {
       ({ default: makeWASocket, useMultiFileAuthState, DisconnectReason } = await import('@whiskeysockets/baileys'));
@@ -203,7 +206,21 @@ async function main(argv) {
       }));
       current.ev.on('messages.upsert', batch => {
         if (socket !== current || currentState !== 'open' || command !== 'run' || stopped) return;
-        try { bridge.stage(batch); }
+        try {
+          const identity = bridge.peer ?? bridge.identity;
+          const diagnostics = (batch.messages ?? []).slice(0, 10).map(message => ({
+            fromMe: message.key?.fromMe,
+            remoteMatches: identity?.aliases.includes(canonicalJid(message.key?.remoteJid)),
+            alternateMatches: identity?.aliases.includes(canonicalJid(message.key?.remoteJidAlt)),
+            keyFields: Object.keys(message.key ?? {}),
+            fields: Object.keys(message.message ?? {}),
+            contextFields: Object.keys(message.message?.extendedTextMessage?.contextInfo ?? {}),
+            timestampRecent: Number(message.messageTimestamp) >= bridge.pairedAt,
+            stubType: message.messageStubType ?? null
+          }));
+          writeJson(store.file('receive-health.json'), { at: epoch(), type: batch.type, messages: diagnostics });
+          bridge.stage(batch);
+        }
         catch { bridge.problem = 'incoming capture failed; retry message'; bridge.health(); }
         enqueue(() => bridge.processPending());
       });
