@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import { privateDirectory, readJson, writeJson, sameRoute, validText } from './core.mjs';
 
 export const REQUEST_STATES = ['received', 'picked-up', 'working', 'waiting', 'completed', 'failed'];
+export const TERMINAL_REQUEST_STATES = ['completed', 'failed'];
 const transitions = {
   received: new Set(['picked-up', 'working', 'waiting', 'completed', 'failed']),
   'picked-up': new Set(['working', 'waiting', 'completed', 'failed']),
@@ -55,6 +56,11 @@ export class RequestJournal {
     if (!record) throw new Error('unknown request identity');
     if (record.state === state && (!text || record.history.at(-1)?.text === clean(text))) return record;
     if (record.state !== state && !transitions[record.state]?.has(state)) throw new Error(`invalid request transition from ${record.state}`);
+    // Reaching this line with a terminal record means the same final state was
+    // replayed with different text. Refuse it without mutating durable history;
+    // only exact replay of the recorded result stays idempotent.
+    if (TERMINAL_REQUEST_STATES.includes(record.state))
+      throw new Error(`request already ${record.state}; recorded result cannot change`);
     const now = this.clock(); record.state = state; record.updated = now;
     record.history = [...record.history, { state, at: now, ...(text ? { text: clean(text) } : {}) }].slice(-32);
     writeJson(file, record); return record;
@@ -69,8 +75,8 @@ export class RequestJournal {
   }
   recentContext(route, { exclude, limit = 4, budget = 2400 } = {}) {
     const records = this.list(route).filter(record => record.key !== exclude);
-    const open = records.filter(x => !['completed', 'failed'].includes(x.state)).slice(0, limit);
-    const completed = records.find(x => ['completed', 'failed'].includes(x.state));
+    const open = records.filter(x => !TERMINAL_REQUEST_STATES.includes(x.state)).slice(0, limit);
+    const completed = records.find(x => TERMINAL_REQUEST_STATES.includes(x.state));
     // Put the latest result first so open work cannot consume the result budget.
     const selected = completed ? [completed, ...open] : open;
     let output = '';
@@ -131,9 +137,9 @@ export class RequestJournal {
     }
     const all = this.list(route);
     let rows;
-    if (lower === 'pending') rows = all.filter(x => !['completed', 'failed'].includes(x.state));
+    if (lower === 'pending') rows = all.filter(x => !TERMINAL_REQUEST_STATES.includes(x.state));
     else if (lower === 'blocked') rows = all.filter(x => x.state === 'waiting' || x.state === 'failed');
-    else if (lower === 'last result') rows = all.filter(x => ['completed', 'failed'].includes(x.state)).slice(0, 1);
+    else if (lower === 'last result') rows = all.filter(x => TERMINAL_REQUEST_STATES.includes(x.state)).slice(0, 1);
     else rows = all;
     const cursor = { kind: 'requests', query: lower, keys: rows.map(x => x.key), index: 0, offset: 0, at: this.clock() };
     return this.requestPage(cursor, route);
