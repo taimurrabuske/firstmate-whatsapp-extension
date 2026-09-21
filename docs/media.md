@@ -11,7 +11,7 @@
 
 The caller should pass the accepted surrogate `text` through the ordinary durable pending/inbox path and retain the returned `key`; captions and quoted payloads are intentionally not treated as instructions. Groups, other senders, history/stale messages, forwarded media, view-once/wrapped messages, outbound echoes in second-number mode, and non-PTT audio are rejected before download. Current limits are 8 MiB images, 15 MiB documents, 10 MiB/thirty-minute voice, and 120-byte filenames.
 
-Supported outgoing types are JPEG, PNG, WebP, PDF, plain text, CSV, and JSON. Incoming additionally accepts PTT Ogg/Opus, MP3, or MP4 voice notes. Baileys integration can inject its installed `downloadMediaMessage`/stream helper; no network locator from a message should be passed to `stageAttachment` or `outboundContent`.
+Supported outgoing types are JPEG, PNG, WebP, PDF, plain text, CSV, and JSON; delegate-facing policy reserves `reply-file` for PNG/JPEG/WebP, PDF, CSV, and JSON, and delivers text/markdown reports as WhatsApp-formatted `reply` text instead (see the [delegate skill](../skills/whatsapp-delegate/SKILL.md)). Incoming additionally accepts PTT Ogg/Opus, MP3, or MP4 voice notes. Baileys integration can inject its installed `downloadMediaMessage`/stream helper; no network locator from a message should be passed to `stageAttachment` or `outboundContent`.
 
 ## Offline voice configuration
 
