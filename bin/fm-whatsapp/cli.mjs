@@ -11,14 +11,17 @@ import { stageAttachment, outboundContent, attachmentBytes } from './media.mjs';
 import { loadVoiceConfig, transcribeVoice, validateVoicePaths, VOICE_CONFIG_SCHEMA } from './voice.mjs';
 import { WHISPER_MODEL_CATALOG, catalogModels, installWhisperModel, removeWhisperModel, resolveCatalogModel } from './model-store.mjs';
 import { MediaIntake } from './media-intake.mjs';
+import { install, installPaths, adapterIdentity, stageDirectory, bindingStatus, renderUnit, unitStatus } from './install.mjs';
 import { QUARANTINE_INSPECTION_LIMIT, quarantineSummary, retainPrivateState } from './retention.mjs';
 import { TelegramDelegate, telegramStore, telegramConfig, telegramConfigured, configureTelegram } from './telegram.mjs';
-import { Acknowledgements, Bridge, Store, readJson, writeJson, delegateState, verifyHomeBinding, ownIdentity, canonicalJid, authenticatedMessage, validText, parseRequest, epoch, MAX_TEXT, MAX_QUEUE, validateSnapshot } from './core.mjs';
+import { Acknowledgements, Bridge, Store, currentBoot, lockOwnerAlive, readJson, writeJson, delegateState, verifyHomeBinding, ownIdentity, canonicalJid, authenticatedMessage, validText, parseRequest, epoch, MAX_TEXT, MAX_QUEUE, validateSnapshot } from './core.mjs';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const help = `Usage: FM_HOME=/absolute/home bin/fm-whatsapp.sh <command>
   pair [--qr-file /absolute/file]  Display a QR (SVG when file ends .svg), exit after linking.
   run                            Run the self-chat bridge until stopped with SIGINT/SIGTERM.
   status                         Print private bridge health and single-instance lock ownership without connecting.
+  install [--systemd] [--dry-run]  Stage the inbox adapter and its configuration from this checkout, write the
+                                 systemd user unit with --systemd, and print Firstmate's bind or upgrade commands.
   doctor                         Verify installation, dependencies, private state, single-instance ownership, queues,
                                  uncertain handoffs, adapter liveness, and service-manager binding. Read-only.
   reply <message-key>            Queue stdin response to an accepted phone request, including outside AFK.
@@ -81,7 +84,7 @@ function realpathOrNull(file) { try { return fs.realpathSync(file); } catch { re
 // removes a lock; 'exited' means the recorded pid is gone (stale), 'live'
 // means the recorded process still exists. Locks recorded before owner
 // metadata was introduced report null home/delegateState/started.
-export function lockOwner(state, processAlive = pid => { process.kill(pid, 0); }) {
+export function lockOwner(state, processAlive = pid => { process.kill(pid, 0); }, boot = currentBoot()) {
   const file = path.join(state, 'whatsapp', 'run.lock');
   const stat = lstatOrNull(file);
   if (!stat) return { state: 'absent', file };
@@ -90,8 +93,12 @@ export function lockOwner(state, processAlive = pid => { process.kill(pid, 0); }
   try { owner = readJson(path.join(file, 'owner.json')); } catch { owner = null; }
   if (!Number.isInteger(owner?.pid) || owner.pid < 1) return { state: 'unreadable', file };
   let liveness = 'unknown';
-  try { processAlive(owner.pid); liveness = 'live'; }
-  catch (error) { if (error?.code === 'ESRCH') liveness = 'exited'; }
+  // A pre-boot owner is stale whatever its recorded pid now names.
+  if (!lockOwnerAlive(owner, boot, () => {})) liveness = 'exited';
+  else {
+    try { processAlive(owner.pid); liveness = 'live'; }
+    catch (error) { if (error?.code === 'ESRCH') liveness = 'exited'; }
+  }
   return { state: liveness, file, pid: owner.pid,
     started: Number.isInteger(owner?.started) ? owner.started : null,
     home: typeof owner?.home === 'string' ? owner.home : null,
@@ -189,7 +196,7 @@ export function doctorReport({ home, env = process.env, extensionRoot = root,
     else {
       const age = lock.started == null ? null : Math.max(0, now - lock.started);
       if (lock.state === 'live') note(`a bridge process (pid ${lock.pid}) holds this state; a second instance refuses to start`);
-      else problem(`stale run.lock from exited pid ${lock.pid}${age == null ? '' : ` (lock age ${age}s)`}; confirm the process is gone, then remove ${lock.file} manually`);
+      else note(`stale run.lock from exited pid ${lock.pid}${age == null ? '' : ` (lock age ${age}s)`}; the next run reclaims ${lock.file} automatically`);
       // A lock recorded for another home or private state directory means the
       // service manager is starting the bridge with a mismatched environment.
       // Diagnostics only name the alignment action; they never remove a lock.
@@ -257,6 +264,21 @@ export function doctorReport({ home, env = process.env, extensionRoot = root,
         else ok('inbox adapter configuration matches this home and private state');
       }
     }
+    // Drift between this checkout and what runs outside it (read-only).
+    try {
+      const paths = installPaths({ home, env });
+      const identity = adapterIdentity(extensionRoot);
+      const binding = bindingStatus(paths.binding, identity, stageDirectory(paths.stageRoot, identity));
+      if (binding.state === 'current') ok('Firstmate binds the inbox adapter this checkout ships');
+      else if (binding.state === 'outdated') note('Firstmate binds an older inbox adapter than this checkout ships; run install to stage it and print the upgrade commands');
+      else if (binding.state === 'unbound') note('Firstmate has no inbox adapter binding; run install for the bind commands');
+      else problem(`Firstmate binding ${paths.binding} is unreadable; inspect it`);
+      const unit = unitStatus(paths.unit, renderUnit({ extensionRoot, home, env }));
+      if (unit === 'current') ok('systemd user unit matches this checkout');
+      else if (unit === 'differs') note(`systemd user unit ${paths.unit} differs from this checkout; run install --systemd`);
+    } catch (error) {
+      note(`installation drift could not be checked: ${error.message}`);
+    }
     const beaconFile = path.join(env.FM_STATE_OVERRIDE || path.join(home, 'state'), '.last-watcher-beat');
     const beacon = lstatOrNull(beaconFile);
     if (!beacon || !beacon.isFile() || beacon.isSymbolicLink()) note('no controller watcher beacon found; wake liveness is unproven');
@@ -276,6 +298,12 @@ export function doctorReport({ home, env = process.env, extensionRoot = root,
 export function parseArgs(argv) {
   const command = argv.shift() || 'help';
   let qrFile, recipient, messageKey, progressState, attachmentFile, value, tokenFile, userId, voiceAction, voicePaths, voiceModelAction, voiceModelName;
+  let installSystemd = false, installDryRun = false;
+  if (command === 'install') {
+    const unknown = argv.filter(flag => !['--systemd', '--dry-run'].includes(flag));
+    if (unknown.length) throw new Error('install accepts only --systemd and --dry-run');
+    installSystemd = argv.includes('--systemd'); installDryRun = argv.includes('--dry-run'); argv = [];
+  }
   if (command === 'progress' && argv.length === 2) [messageKey, progressState] = argv.splice(0);
   if (command === 'reply-file' && argv.length === 2) [messageKey, attachmentFile] = argv.splice(0);
   if (['summary', 'preferences'].includes(command) && argv.length) value = argv.splice(0).join(' ');
@@ -319,8 +347,8 @@ export function parseArgs(argv) {
       (command === 'summary' && !['status', 'pending', 'blocked', 'decisions', 'last result', 'more'].includes(value)) ||
       (command === 'preferences' && !value) || (command === 'telegram-config' && (!tokenFile || !userId)) ||
       (command === 'voice-config' && !voiceAction) || (command === 'voice-model' && !voiceModelAction) ||
-      !['pair', 'run', 'status', 'doctor', 'notify', 'reply', 'progress', 'reply-file', 'summary', 'preferences', 'voice-status', 'voice-config', 'voice-model', 'telegram-config', 'enable', 'disable', 'recipient', 'ping', 'help', '--help'].includes(command)) throw new Error('invalid command; use help');
-  return { command, qrFile, recipient, messageKey, progressState, attachmentFile, value, tokenFile, userId, voiceAction, voicePaths, voiceModelAction, voiceModelName };
+      !['pair', 'run', 'status', 'doctor', 'install', 'notify', 'reply', 'progress', 'reply-file', 'summary', 'preferences', 'voice-status', 'voice-config', 'voice-model', 'telegram-config', 'enable', 'disable', 'recipient', 'ping', 'help', '--help'].includes(command)) throw new Error('invalid command; use help');
+  return { command, qrFile, recipient, messageKey, progressState, attachmentFile, value, tokenFile, userId, voiceAction, voicePaths, voiceModelAction, voiceModelName, installSystemd, installDryRun };
 }
 export function qrSvg(code) {
   const size = code.getModuleCount(), edge = size + 8;
@@ -337,10 +365,23 @@ function writeQr(file, text) {
 }
 async function main(argv) {
   process.umask(0o077);
-  const { command, qrFile, recipient, messageKey, progressState, attachmentFile, value, tokenFile, userId, voiceAction, voicePaths, voiceModelAction, voiceModelName } = parseArgs(argv);
+  const { command, qrFile, recipient, messageKey, progressState, attachmentFile, value, tokenFile, userId, voiceAction, voicePaths, voiceModelAction, voiceModelName, installSystemd, installDryRun } = parseArgs(argv);
   if (command === 'help' || command === '--help') { process.stdout.write(help); return; }
   const home = process.env.FM_HOME;
   if (!home || !path.isAbsolute(home)) throw new Error('set FM_HOME to an absolute operational home');
+  if (command === 'install') {
+    // Installation output names local paths and commands only, never private
+    // state contents, so its failures are reported instead of redacted.
+    try {
+      const result = install({ home, env: process.env, extensionRoot: root, systemd: installSystemd, apply: !installDryRun });
+      process.stdout.write(`fm-whatsapp install${installDryRun ? ' (dry run)' : ''}\nhome: ${home}\n`);
+      for (const line of result.lines) process.stdout.write(`${line}\n`);
+      return result.lines.some(line => line.startsWith('problem:')) ? 1 : undefined;
+    } catch (error) {
+      process.stderr.write(`fm-whatsapp install: ${error.message}\n`);
+      return 1;
+    }
+  }
   if (command === 'doctor') {
     const report = doctorReport({ home, env: process.env, extensionRoot: root });
     process.stdout.write(`fm-whatsapp installation check\nhome: ${home}\n`);

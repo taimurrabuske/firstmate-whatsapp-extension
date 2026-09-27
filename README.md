@@ -34,6 +34,16 @@ Start the bridge and leave it running:
 ./bin/fm-whatsapp.sh run
 ```
 
+To keep it running across logins and reboots, let this checkout write its systemd user unit, then enable it:
+
+```bash
+./bin/fm-whatsapp.sh install --systemd
+systemctl --user daemon-reload && systemctl --user enable --now firstmate-whatsapp.service
+```
+
+The unit comes from `systemd/firstmate-whatsapp.service.in`; edit the template here, never the installed copy, and rerun `install --systemd` after moving this checkout.
+A reboot cannot jam the bridge: a run lock left by an exited process, or recorded before the current boot, is reclaimed at the next start, while a live bridge still refuses a second instance.
+
 To use a second number, stop the bridge and run `./bin/fm-whatsapp.sh recipient +COUNTRYNUMBER` before starting it again.
 Only that number's incoming private messages will be accepted; messages from other contacts and outbound echoes are ignored.
 Use `recipient self` to restore Message yourself.
@@ -104,46 +114,20 @@ Install this repository's small `whatsapp-inbox` process-event package once per 
 The package uses Firstmate's supported external binding interface and leaves its source repository unchanged.
 The controller must remain running with its ordinary watcher healthy.
 
-First prepare a private copy **outside every Git checkout and outside Firstmate's home**.
-Set `FM_DELEGATE_STATE` to the same absolute per-home state directory used by the bridge, and `FM_HOME`/`FM_CODE_ROOT` as above.
-From this extension's checkout:
+Set `FM_DELEGATE_STATE` to the same absolute per-home state directory used by the bridge, if you override it, and `FM_HOME`/`FM_CODE_ROOT` as above.
+From this extension's checkout, after pairing:
 
 ```bash
-export WHATSAPP_EXTENSION_ROOT="$PWD"
-export WHATSAPP_ADAPTER_STAGE="$HOME/.local/share/firstmate-whatsapp/inbox-adapter-1.0.0"
-export WHATSAPP_ADAPTER_CONFIG="$FM_DELEGATE_STATE/inbox-adapter.json"
-mkdir -p "$WHATSAPP_ADAPTER_STAGE/bin"
-cp adapter/firstmate-extension.json "$WHATSAPP_ADAPTER_STAGE/"
-cp adapter/bin/firstmate-extension.mjs "$WHATSAPP_ADAPTER_STAGE/bin/"
-chmod 755 "$WHATSAPP_ADAPTER_STAGE" "$WHATSAPP_ADAPTER_STAGE/bin" "$WHATSAPP_ADAPTER_STAGE/bin/firstmate-extension.mjs"
-chmod 644 "$WHATSAPP_ADAPTER_STAGE/firstmate-extension.json"
-node --input-type=module <<'NODE'
-import fs from 'node:fs';
-import path from 'node:path';
-const env = process.env;
-const config = {
-  schema: 'firstmate.whatsapp-inbox-config.v1',
-  source_id: 'whatsapp-inbox-main',
-  whatsapp_state: fs.realpathSync(path.join(env.FM_DELEGATE_STATE, 'whatsapp')),
-  fm_home: fs.realpathSync(env.FM_HOME),
-  fm_state: fs.realpathSync(env.FM_STATE_OVERRIDE || path.join(env.FM_HOME, 'state')),
-  extension_root: fs.realpathSync(env.WHATSAPP_EXTENSION_ROOT),
-  poll_ms: 30000
-};
-fs.writeFileSync(env.WHATSAPP_ADAPTER_CONFIG, JSON.stringify(config) + '\n', { mode: 0o600, flag: 'wx' });
-NODE
+./bin/fm-whatsapp.sh install --dry-run   # show what would change
+./bin/fm-whatsapp.sh install
 ```
 
-The active Firstmate owner loads its `process-event-sources` skill, then binds and registers this explicitly trusted same-user package:
-
-```bash
-"$FM_CODE_ROOT/bin/fm-extension.sh" bind "$WHATSAPP_ADAPTER_STAGE" \
-  --adapter whatsapp-inbox --trust-same-user-code --consent task-metadata --timeout-ms 45000
-"$FM_CODE_ROOT/bin/fm-procevent.sh" register-extension whatsapp-inbox whatsapp-inbox-main \
-  --config-ref "$WHATSAPP_ADAPTER_CONFIG"
-"$FM_CODE_ROOT/bin/fm-procevent.sh" reconcile
-"$FM_CODE_ROOT/bin/fm-procevent.sh" list
-```
+`install` stages the adapter package outside every checkout, under `${XDG_DATA_HOME:-~/.local/share}/firstmate-whatsapp/inbox-adapter-<version>-<content digest>/`, writes the source configuration once to `$FM_DELEGATE_STATE/inbox-adapter.json`, and compares Firstmate's binding with what this checkout ships.
+It never binds or registers anything itself: the active Firstmate owner loads its `process-event-sources` skill and runs the exact commands `install` prints.
+For a first installation those are `fm-extension.sh bind`, `fm-procevent.sh register-extension`, and `fm-procevent.sh reconcile`.
+For an upgrade they retire the old registration and binding first, in the order Firstmate's retirement contract requires, with the registered binding digest filled in; the registration token stays in Firstmate's record and is never printed.
+An existing source configuration is never rewritten, because a live registration references it; `install` reports a difference instead.
+`doctor` reports when Firstmate binds an older adapter, or when the installed systemd unit differs from the template.
 
 Confirm the source is reported `live`; a registration alone does not prove a runner is listening.
 Preserve the exact token-bound retirement command printed during registration if the source must later be removed.
@@ -206,12 +190,12 @@ Never commit or share these files.
 Stopping preserves the linked session; unlink it from the phone to revoke it.
 The runtime can be supervised by an existing process manager using the same explicit environment.
 Do not launch a second copy against the same state directory.
-After an unclean shutdown, inspect the reported `run.lock` and confirm its recorded process is gone before removing that lock directory.
+After an unclean shutdown or a reboot, `run` reclaims a `run.lock` whose recorded process has exited or was started before the current boot; a lock with no readable owner still needs manual inspection.
 
 `./bin/fm-whatsapp.sh doctor` is a read-only diagnostic for operators and process managers.
 It classifies bridge health and recovery posture without connecting: connected versus disconnected transports, live versus stale single-instance lock ownership (including lock age and a lock recorded for another Firstmate home or private state directory, which usually means the service manager exports a mismatched `FM_HOME` or `FM_DELEGATE_STATE`), queued, pending, and uncertain request counts, handoff receipts left uncertain or mid-publication by an interrupted bridge, inbox wake adapter configuration and controller watcher beacon liveness, and fresh connected health that no live lock owns.
 Each finding names the exact safe next action, such as aligning the service-manager environment or comparing a handoff receipt with Firstmate's pending and handled inbox.
-Diagnostics never remove a lock, retry an uncertain handoff, restart a service, or mutate queues, and they never print credentials, phone numbers, or message bodies; recovery stays manual and bounded by inspection.
+Diagnostics never remove a lock (only `run` reclaims a stale one), retry an uncertain handoff, restart a service, or mutate queues, and they never print credentials, phone numbers, or message bodies; recovery stays manual and bounded by inspection.
 
 Inbound messages are accepted only from the selected private chat.
 Other contacts, groups, forwarded content, history, and unsupported media are ignored. Text is handed to the controller as a request, never evaluated as shell code by the bridge.
