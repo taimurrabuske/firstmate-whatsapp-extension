@@ -343,27 +343,62 @@ export class Store {
     }
     return null;
   }
-  lock() {
+  // Single-instance ownership. A lock whose owner exited, or was recorded
+  // before the current boot (pids are reused after a reboot), is reclaimed:
+  // it is renamed aside atomically, so two starters cannot both win, then
+  // removed. A live owner from this boot still refuses a second bridge.
+  lock({ boot = currentBoot(), processAlive = pid => { process.kill(pid, 0); } } = {}) {
     const lock = this.file('run.lock');
-    try { fs.mkdirSync(lock, { mode: 0o700 }); }
-    catch (error) {
-      if (error.code !== 'EEXIST') throw error;
-      const owner = readJson(path.join(lock, 'owner.json'));
-      // Missing owner is an initialization/crash ambiguity, never an excuse to race.
-      if (!Number.isInteger(owner?.pid) || owner.pid < 1) throw new Error('bridge lock requires inspection');
-      try { process.kill(owner.pid, 0); throw new Error('another bridge owns this home'); }
-      catch (probe) { if (probe.code !== 'ESRCH') throw probe; }
-      throw new Error('stale bridge lock; inspect and remove run.lock before restarting');
+    for (let attempt = 0; ; attempt += 1) {
+      try { fs.mkdirSync(lock, { mode: 0o700 }); break; }
+      catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+        const owner = readJson(path.join(lock, 'owner.json'));
+        // Missing owner is an initialization/crash ambiguity, never an excuse to race.
+        if (!Number.isInteger(owner?.pid) || owner.pid < 1) throw new Error('bridge lock requires inspection');
+        if (lockOwnerAlive(owner, boot, processAlive)) throw new Error('another bridge owns this home');
+        if (attempt > 0) throw new Error('stale bridge lock could not be reclaimed; inspect run.lock');
+        const aside = `${lock}.stale-${process.pid}-${crypto.randomUUID()}`;
+        try { fs.renameSync(lock, aside); }
+        catch (rename) { if (rename.code !== 'ENOENT') throw rename; continue; }
+        fs.rmSync(aside, { recursive: true, force: true });
+        process.stderr.write('fm-whatsapp: reclaimed a stale bridge lock left by an exited process\n');
+      }
     }
     // Owner metadata lets read-only diagnostics distinguish live from stale
     // ownership and detect a service manager bound to another home or state.
     const token = crypto.randomUUID();
-    writeJson(path.join(lock, 'owner.json'), { pid: process.pid, token, started: epoch(), home: this.home, delegateState: this.root });
+    writeJson(path.join(lock, 'owner.json'), { pid: process.pid, token, started: epoch(), bootId: boot.id,
+      home: this.home, delegateState: this.root });
     return () => {
       const current = readJson(path.join(lock, 'owner.json'));
       if (current?.token === token) fs.rmSync(lock, { recursive: true });
     };
   }
+}
+
+// The kernel's per-boot identity and boot time. Either may be null off Linux,
+// where only pid liveness decides.
+export function currentBoot() {
+  let id = null; let btime = null;
+  try { id = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() || null; } catch { id = null; }
+  try {
+    const line = fs.readFileSync('/proc/stat', 'utf8').split('\n').find(row => row.startsWith('btime '));
+    const value = Number.parseInt(line?.slice(6) ?? '', 10);
+    btime = Number.isInteger(value) ? value : null;
+  } catch { btime = null; }
+  return { id, btime };
+}
+
+// True only when the recorded owner can still be the running bridge: it was
+// recorded during this boot and its pid exists. An unprobeable pid counts as
+// alive so an unknown state never races a real owner.
+export function lockOwnerAlive(owner, boot, processAlive) {
+  if (typeof owner?.bootId === 'string' && boot?.id && owner.bootId !== boot.id) return false;
+  if (typeof owner?.bootId !== 'string' && Number.isInteger(owner?.started) && Number.isInteger(boot?.btime)
+    && owner.started < boot.btime) return false;
+  try { processAlive(owner.pid); return true; }
+  catch (probe) { return probe?.code !== 'ESRCH'; }
 }
 
 export class Bridge {

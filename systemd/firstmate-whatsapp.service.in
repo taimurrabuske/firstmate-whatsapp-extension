@@ -1,0 +1,19 @@
+# Rendered by `bin/fm-whatsapp.sh install --systemd`; edit the template in the
+# extension repository, not the installed copy.
+[Unit]
+Description=Firstmate private WhatsApp delegate
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@EXTENSION_ROOT@
+Environment=FM_HOME=@FM_HOME@
+@EXTRA_ENVIRONMENT@
+ExecStart=@NODE@ @EXTENSION_ROOT@/bin/fm-whatsapp/cli.mjs run
+Restart=on-failure
+RestartSec=10
+UMask=0077
+
+[Install]
+WantedBy=default.target

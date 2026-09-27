@@ -324,7 +324,7 @@ test('status CLI is read-only, redacts account and credentials, and rejects impl
   assert.equal(exited.status, 0);
   writeJson(f.store.file('run.lock/owner.json'), { pid: exited.pid, token: 'gone', started: 900 });
   assert.equal(safeHealth(f.state, 1000).lock, 'exited');
-  writeJson(f.store.file('run.lock/owner.json'), { pid: process.pid, token: 'self', started: 900 });
+  writeJson(f.store.file('run.lock/owner.json'), { pid: process.pid, token: 'self', started: Math.floor(Date.now() / 1000) });
   assert.equal(safeHealth(f.state, 1000).lock, 'live');
 });
 
@@ -426,4 +426,57 @@ test('supervisor replies survive absent AFK but never move to a changed recipien
   assert.equal(f.calls.sent[0].jid, identity.account);
   assert.match(f.calls.sent[0].text, /Your requested result/);
   assert.equal(f.store.records('outbox').length, 0);
+});
+
+// Regression for the 2026-09-27 outage: after a reboot the bridge crash-looped
+// because run.lock from the dead pre-reboot process blocked every start.
+function lockStore(t) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'fm-whatsapp-lock-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  return new Store(home, path.join(home, 'delegate-state'));
+}
+function plantLock(store, owner) {
+  fs.mkdirSync(store.file('run.lock'), { recursive: true, mode: 0o700 });
+  writeJson(store.file('run.lock/owner.json'), owner);
+}
+const boot = { id: 'boot-now', btime: 5000 };
+const alive = () => {};
+const gone = () => { const error = new Error('no such process'); error.code = 'ESRCH'; throw error; };
+
+test('a lock left by an exited owner is reclaimed and the new owner records this boot', t => {
+  const store = lockStore(t);
+  plantLock(store, { pid: 424242, token: 'dead', started: 6000, bootId: 'boot-now' });
+  const release = store.lock({ boot, processAlive: gone });
+  const owner = readJson(store.file('run.lock/owner.json'));
+  assert.equal(owner.pid, process.pid);
+  assert.equal(owner.bootId, 'boot-now');
+  assert.deepEqual(fs.readdirSync(path.dirname(store.file('run.lock'))).filter(name => name.includes('stale')), []);
+  release();
+  assert.ok(!fs.existsSync(store.file('run.lock')));
+});
+
+test('a lock recorded before this boot is reclaimed even when its pid was reused', t => {
+  const store = lockStore(t);
+  plantLock(store, { pid: process.pid, token: 'old-boot', started: 6000, bootId: 'boot-before' });
+  store.lock({ boot, processAlive: alive })();
+  plantLock(store, { pid: process.pid, token: 'legacy', started: 4000 });
+  store.lock({ boot, processAlive: alive })();
+});
+
+test('a live owner from this boot still refuses a second bridge', t => {
+  const store = lockStore(t);
+  plantLock(store, { pid: process.pid, token: 'live', started: 6000, bootId: 'boot-now' });
+  assert.throws(() => store.lock({ boot, processAlive: alive }), /another bridge owns this home/);
+  plantLock(store, { pid: process.pid, token: 'legacy-live', started: 6000 });
+  assert.throws(() => store.lock({ boot, processAlive: alive }), /another bridge owns this home/);
+  assert.equal(readJson(store.file('run.lock/owner.json')).token, 'legacy-live');
+});
+
+test('an unprobeable owner and a missing owner record are never raced', t => {
+  const store = lockStore(t);
+  plantLock(store, { pid: 7, token: 'eperm', started: 6000, bootId: 'boot-now' });
+  const denied = () => { const error = new Error('denied'); error.code = 'EPERM'; throw error; };
+  assert.throws(() => store.lock({ boot, processAlive: denied }), /another bridge owns this home/);
+  fs.rmSync(store.file('run.lock/owner.json'));
+  assert.throws(() => store.lock({ boot, processAlive: gone }), /requires inspection/);
 });

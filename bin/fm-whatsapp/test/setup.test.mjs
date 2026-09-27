@@ -71,7 +71,7 @@ test('paired healthy state passes every private-state, recipient and health chec
   assert.ok(!text.includes('15555550999')); assert.ok(!text.includes('15555550123'));
 });
 
-test('stale lock from an exited pid is a problem naming the manual removal path', t => {
+test('stale lock from an exited pid is a note that the next run reclaims it', t => {
   const { fx, store } = paired(t);
   const exited = spawnSync(process.execPath, ['-e', '']);
   assert.equal(exited.status, 0);
@@ -79,11 +79,11 @@ test('stale lock from an exited pid is a problem naming the manual removal path'
   fs.mkdirSync(store.file('run.lock'), { mode: 0o700 });
   writeJson(store.file('run.lock/owner.json'), { pid: exited.pid, token: 'gone' });
   const result = fx.report();
-  assert.equal(result.ready, false);
   const line = result.lines.find(line => line.includes('run.lock'));
-  assert.match(line, /stale run\.lock/);
+  assert.match(line, /^note: stale run\.lock/);
   assert.ok(line.includes(String(exited.pid)));
-  assert.match(line, /remove/);
+  assert.match(line, /reclaims/);
+  assert.ok(!result.lines.some(row => row.startsWith('problem: stale run.lock')));
 });
 
 test('stale lock age from recorded ownership bounds how long the state was held', t => {

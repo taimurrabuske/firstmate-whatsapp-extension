@@ -30,7 +30,7 @@ test('unmodified Firstmate AFK and classifier interoperate without a new reach s
   };
   const enable = value => fs.writeFileSync(path.join(delegate, 'whatsapp/enabled.json'), JSON.stringify({ enabled: value }));
   assert.equal(events().afk, false);
-  contract('propose'); contract('confirm');
+  contract('enter');
   assert.equal(contract('field', 'reach_channels').trim(), 'none');
   const original = fs.readFileSync(path.join(state, '.afk-contract'));
   assert.equal(events().afk, false);
@@ -55,7 +55,7 @@ test('unmodified Firstmate AFK and classifier interoperate without a new reach s
   assert.equal(outcomes.filter(event => event.kind === 'failure').length, 1);
   enable(false); assert.equal(events().afk, false);
   enable(true); contract('archive'); assert.equal(events().afk, false);
-  contract('propose'); contract('confirm');
+  contract('enter');
   fs.writeFileSync(path.join(state, '.afk-contract'), 'broken record\n');
   assert.notEqual(invoke(path.join(root, 'bin/fm-whatsapp-events.sh'), ['--json']).status, 0);
 });
