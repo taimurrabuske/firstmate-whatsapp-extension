@@ -3,6 +3,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { readJson, readStoredRecord, queuedJobShape, writeJson, privateDirectory, sha256, epoch, validText, parseRequest, PREFIX, sameRoute, plainRecord,
   truncateText, outboundOrder, REMOTE_HELP } from './core.mjs';
+import { MEDIA_LIMITS, inboundKind, inboundName, stageInboundMedia, inboundMediaText } from './media.mjs';
+
+// Telegram's Bot API serves downloads of at most 20 MB; every local limit is lower.
+const FILE_ID = /^[A-Za-z0-9_-]{1,256}$/;
+const FILE_PATH = /^[A-Za-z0-9_-]+(\/[A-Za-z0-9_.-]+)*$/;
+const MEDIA_ATTEMPTS = 3;
+const MEDIA_FAILED = 'I could not process that attachment locally. It is retained privately where it was received; send the request as text or resend the attachment.';
 
 function tokenAt(file) {
   if (!path.isAbsolute(file)) throw new Error('Telegram token file must be absolute');
@@ -66,6 +73,23 @@ export class TelegramClient {
     } catch { throw new Error('Telegram request failed; details omitted'); }
   }
   updates(offset) { return this.call('getUpdates', { offset, timeout: 0, limit: 50, allowed_updates: ['message'] }); }
+  /**
+   * Stream one authenticated inbound file. The token-bearing download URL is
+   * never returned, persisted or included in an error.
+   */
+  async download(fileId, maximum) {
+    if (!FILE_ID.test(fileId ?? '') || !Number.isInteger(maximum) || maximum < 1) throw new Error('invalid Telegram file request');
+    const file = await this.call('getFile', { file_id: fileId });
+    if (typeof file?.file_path !== 'string' || !FILE_PATH.test(file.file_path) || file.file_path.split('/').includes('..') ||
+        !Number.isInteger(file.file_size) || file.file_size < 1 || file.file_size > maximum) throw new Error('Telegram file unavailable or oversized');
+    let response;
+    try {
+      response = await this.fetcher(`https://api.telegram.org/file/bot${this.config.token}/${file.file_path}`,
+        { method: 'GET', signal: AbortSignal.timeout(60000), redirect: 'error' });
+    } catch { throw new Error('Telegram download failed; details omitted'); }
+    if (!response?.ok || !response.body) throw new Error('Telegram download failed; details omitted');
+    return response.body;
+  }
   async send(text, attachment) {
     let result;
     if (attachment) {
@@ -101,23 +125,91 @@ export async function configureTelegram(store, tokenFile, userId, { fetcher = fe
     whatsappRoute: store.currentRoute() });
 }
 
+// Exactly one supported media field, validated against the same limits and
+// MIME allowlist WhatsApp media uses. Returns null for anything else.
+function telegramMedia(message) {
+  const fields = ['voice', 'audio', 'photo', 'document', 'video', 'video_note', 'animation', 'sticker', 'contact', 'location', 'venue', 'poll', 'dice']
+    .filter(name => message[name] != null);
+  if (fields.length !== 1) return null;
+  const field = fields[0], id = message.message_id;
+  if (field === 'voice' || field === 'audio') {
+    const body = message[field], mime = String(body.mime_type ?? (field === 'voice' ? 'audio/ogg' : '')).toLowerCase();
+    if (inboundKind(mime) !== 'voice' || !FILE_ID.test(body.file_id ?? '') || !Number.isInteger(body.file_size) ||
+        body.file_size < 1 || body.file_size > MEDIA_LIMITS.voice ||
+        !Number.isInteger(body.duration) || body.duration < 1 || body.duration > MEDIA_LIMITS.voiceSeconds) return null;
+    return { kind: 'voice', mime, fileId: body.file_id, size: body.file_size, duration: body.duration,
+      name: inboundName(body.file_name, `voice-TG_${id}${mime.startsWith('audio/ogg') ? '.ogg' : ''}`) };
+  }
+  if (field === 'photo') {
+    if (!Array.isArray(message.photo) || !message.photo.length || message.photo.length > 20) return null;
+    const usable = message.photo.filter(size => FILE_ID.test(size?.file_id ?? '') && Number.isInteger(size.file_size) &&
+      size.file_size >= 1 && size.file_size <= MEDIA_LIMITS.image);
+    if (!usable.length) return null;
+    const best = usable.reduce((a, b) => (b.file_size > a.file_size ? b : a));
+    return { kind: 'image', mime: 'image/jpeg', fileId: best.file_id, size: best.file_size, duration: 0, name: `image-TG_${id}.jpg` };
+  }
+  if (field === 'document') {
+    const body = message.document, mime = String(body.mime_type ?? '').toLowerCase(), kind = inboundKind(mime);
+    if (!['image', 'document'].includes(kind) || !FILE_ID.test(body.file_id ?? '') || !Number.isInteger(body.file_size) ||
+        body.file_size < 1 || body.file_size > MEDIA_LIMITS[kind]) return null;
+    return { kind, mime, fileId: body.file_id, size: body.file_size, duration: 0, name: inboundName(body.file_name, `document-TG_${id}`) };
+  }
+  return null;
+}
+
 export function authenticatedTelegram(update, config, now = epoch()) {
   const message = update?.message;
   if (!Number.isSafeInteger(update?.update_id) || !Number.isSafeInteger(message?.message_id) ||
       message.chat?.type !== 'private' || String(message.chat.id) !== config.chatId ||
       String(message.from?.id) !== config.userId || message.from?.is_bot ||
       message.forward_origin || message.forward_date || message.sender_chat || message.via_bot ||
-      !Number.isInteger(message.date) || message.date < config.enabledAt || message.date < now - 86400 || message.date > now + 300 ||
-      !validText(message.text) || message.text.startsWith(PREFIX)) return null;
-  return { key: sha256(`telegram\n${JSON.stringify(config.route)}\n${message.message_id}`), text: message.text,
+      !Number.isInteger(message.date) || message.date < config.enabledAt || message.date < now - 86400 || message.date > now + 300) return null;
+  const identity = { key: sha256(`telegram\n${JSON.stringify(config.route)}\n${message.message_id}`),
     remoteId: `TG_${message.message_id}`, quotedId: message.reply_to_message ? `TG_${message.reply_to_message.message_id}` : null };
+  if (message.text != null) {
+    if (!validText(message.text) || message.text.startsWith(PREFIX)) return null;
+    return { ...identity, text: message.text };
+  }
+  const media = telegramMedia(message);
+  if (!media) return null;
+  const caption = message.caption == null ? '' : message.caption;
+  if (caption && (!validText(caption) || caption.startsWith(PREFIX))) return null;
+  return { ...identity, text: '', caption, media };
 }
 
 export class TelegramDelegate {
   constructor({ store, adapter, clientFactory = config => new TelegramClient(config), clock = epoch, attachmentReader,
-    notificationAllowed = () => true, command = async () => null }) {
-    Object.assign(this, { store, adapter, clientFactory, clock, attachmentReader, notificationAllowed, command });
+    notificationAllowed = () => true, command = async () => null, transcribe }) {
+    Object.assign(this, { store, adapter, clientFactory, clock, attachmentReader, notificationAllowed, command, transcribe });
     this.lastPoll = 0;
+  }
+  // Download, stage and describe one pending media job in place, so the rest of
+  // the ordinary note path sees surrogate text exactly like a WhatsApp attachment.
+  // Returns false while the job must wait; after the final failed attempt the
+  // person is told once and the job retires.
+  async resolveMedia(job, file, client) {
+    try {
+      const metadata = { kind: job.media.kind, mime: job.media.mime, size: job.media.size, duration: job.media.duration, name: job.media.name };
+      const source = await client.download(job.media.fileId, MEDIA_LIMITS[metadata.kind]);
+      const attachment = await stageInboundMedia(this.store, source, metadata);
+      job.text = await inboundMediaText(this.store, attachment, metadata,
+        { transcribe: this.transcribe, transport: 'Telegram', caption: job.caption ?? '' });
+      job.attachment = { digest: attachment.digest, path: attachment.path };
+      delete job.media;
+      writeJson(file, job);
+      return true;
+    } catch {
+      job.mediaAttempts = (job.mediaAttempts ?? 0) + 1;
+      if (job.mediaAttempts >= MEDIA_ATTEMPTS) {
+        this.store.enqueue(MEDIA_FAILED, { kind: 'reply', session: '', id: `media-failed:${job.key}`, route: job.route, now: this.clock() });
+        this.store.markIncoming(job.key, this.clock(), { operation: 'media-failed', route: job.route });
+        fs.unlinkSync(file);
+      } else {
+        job.next = this.clock() + Math.min(300, 10 * 2 ** job.mediaAttempts);
+        writeJson(file, job);
+      }
+      return false;
+    }
   }
   async tick(whatsapp, snapshot) {
     let config;
@@ -154,9 +246,16 @@ export class TelegramDelegate {
           writeJson(cursorFile, cursor); // Accepted payload already durable before acknowledging server history.
         }
       }
+      let mediaResolved = false;
       for (const name of this.store.records('telegram-pending').slice(0, 20)) {
         const file = path.join(dir, name), { record: job } = readStoredRecord(this.store.root, file);
         if (!job || !sameRoute(job.route, config.route) || job.next > this.clock()) continue;
+        if (job.media) {
+          // Downloads and local transcription are bounded but slow: one per tick.
+          if (mediaResolved) continue;
+          mediaResolved = true;
+          if (!await this.resolveMedia(job, file, client)) continue;
+        }
         try {
         const request = parseRequest(job.text);
         let response = job.response ?? await this.command(job.text, job.route);

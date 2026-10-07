@@ -91,11 +91,13 @@ export function retainPrivateState(store, requests = null, { now = epoch(), seco
     const digest = job?.attachment?.digest;
     if (typeof digest === 'string' && DIGEST(digest)) protectedDigests.add(digest);
   }
-  for (const bucket of ['pending', 'handoffs', 'requests']) {
+  for (const bucket of ['pending', 'handoffs', 'requests', 'telegram-pending']) {
     for (const name of listBucket(store, bucket).filter(HEX_JSON)) {
       const { record } = readStoredRecord(store.root, store.file(`${bucket}/${name}`));
       if (typeof record?.body === 'string') protectedBodies.push(record.body);
       if (typeof record?.requestText === 'string') protectedBodies.push(record.requestText);
+      // A Telegram media job carries its surrogate text before any handoff body exists.
+      if (bucket === 'telegram-pending' && typeof record?.text === 'string') protectedBodies.push(record.text);
     }
   }
   for (const bucket of ['attachments/outgoing', 'attachments/incoming']) {

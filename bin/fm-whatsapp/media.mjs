@@ -19,6 +19,13 @@ const INBOUND_MIME = new Map([
   ['audio/ogg', 'voice'], ['audio/ogg; codecs=opus', 'voice'], ['audio/mpeg', 'voice'], ['audio/mp4', 'voice']
 ]);
 
+/** The intake kind (image/document/voice) for an allowed inbound MIME type, or null. */
+export function inboundKind(mime) {
+  return INBOUND_MIME.get(String(mime ?? '').toLowerCase()) ?? null;
+}
+/** A safe attachment display name, or the fallback when the offered name is unusable. */
+export function inboundName(value, fallback) { return safeName(value, fallback); }
+
 function directories(store) {
   for (const name of ['attachments', 'attachments/outgoing', 'attachments/incoming']) privateDirectory(store.file(name));
 }
@@ -181,6 +188,36 @@ function mediaEnvelope(message, identity, now, pairedAt, peer) {
 export function authenticateMediaMetadata(message, identity, now, pairedAt, peer = null) {
   return mediaEnvelope(message, identity, now, pairedAt, peer);
 }
+/**
+ * Stage one authenticated inbound download as an immutable private attachment.
+ * Bytes beyond the authenticated declared size, a size mismatch, or content
+ * that does not match the allowed MIME type are refused. Shared by every transport.
+ */
+export async function stageInboundMedia(store, source, metadata) { return writeDownload(store, source, metadata); }
+
+/**
+ * Surrogate request text for a staged inbound attachment, transcribing voice
+ * locally through the injected transcriber. Shared by every transport.
+ */
+export async function inboundMediaText(store, attachment, metadata, { transcribe, transport = 'WhatsApp', caption = '' } = {}) {
+  let detail = '';
+  if (metadata.kind === 'voice') {
+    const result = typeof transcribe === 'function' ? await transcribe(attachment.path, metadata) :
+      { available: false, message: 'Voice transcription is unavailable; configure private offline whisper.cpp and ffmpeg paths.' };
+    if (result?.available && typeof result.text === 'string' && result.text.trim() &&
+        result.text.length <= MAX_INBOUND_TRANSCRIPT) {
+      const transcript = store.file(`attachments/incoming/${attachment.digest}.transcript.txt`);
+      fs.writeFileSync(transcript, result.text, { mode: 0o600 });
+      detail = `\nAuthenticated instruction (local whisper.cpp transcript of this voice note; the paired phone's spoken note text, delivered without any caption):\n` +
+        `Full private transcript (read completely): ${transcript}\n` +
+        `Bounded transcript preview (start):\n${result.text.slice(0, 2200)}\nBounded transcript preview (end).`;
+    } else detail = `\n${result?.message || 'Voice transcription returned no usable text.'}`;
+  }
+  const label = metadata.kind === 'voice' ? 'voice note' : metadata.kind;
+  const captioned = caption ? `\nCaption from the paired person:\n${caption}` : '';
+  return truncateText(`${transport} ${label} received (remote; away mode unchanged).\nLocal attachment: ${attachment.path}\nMIME: ${attachment.mime}; bytes: ${attachment.size}.${detail}${captioned}`, MAX_TEXT);
+}
+
 async function writeDownload(store, source, metadata) {
   directories(store);
   const temp = store.file(`attachments/incoming/.download-${crypto.randomUUID()}.tmp`), fd = fs.openSync(temp, 'wx', 0o600);
@@ -208,19 +245,5 @@ export async function authenticatedMediaMessage(message, identity, now, pairedAt
   const metadata = mediaEnvelope(message, identity, now, pairedAt, peer);
   if (!metadata || typeof download !== 'function' || !store) return null;
   const attachment = await writeDownload(store, await download(message, metadata), metadata);
-  let detail = '';
-  if (metadata.kind === 'voice') {
-    const result = typeof transcribe === 'function' ? await transcribe(attachment.path, metadata) :
-      { available: false, message: 'Voice transcription is unavailable; configure private offline whisper.cpp and ffmpeg paths.' };
-    if (result?.available && typeof result.text === 'string' && result.text.trim() &&
-        result.text.length <= MAX_INBOUND_TRANSCRIPT) {
-      const transcript = store.file(`attachments/incoming/${attachment.digest}.transcript.txt`);
-      fs.writeFileSync(transcript, result.text, { mode: 0o600 });
-      detail = `\nAuthenticated instruction (local whisper.cpp transcript of this voice note; the paired phone's spoken note text, delivered without any caption):\n` +
-        `Full private transcript (read completely): ${transcript}\n` +
-        `Bounded transcript preview (start):\n${result.text.slice(0, 2200)}\nBounded transcript preview (end).`;
-    } else detail = `\n${result?.message || 'Voice transcription returned no usable text.'}`;
-  }
-  const label = metadata.kind === 'voice' ? 'voice note' : metadata.kind;
-  return { ...metadata, attachment, text: truncateText(`WhatsApp ${label} received (remote; away mode unchanged).\nLocal attachment: ${attachment.path}\nMIME: ${attachment.mime}; bytes: ${attachment.size}.${detail}`, MAX_TEXT) };
+  return { ...metadata, attachment, text: await inboundMediaText(store, attachment, metadata, { transcribe, transport: 'WhatsApp' }) };
 }
