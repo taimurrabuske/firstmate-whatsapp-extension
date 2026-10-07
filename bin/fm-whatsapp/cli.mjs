@@ -587,7 +587,8 @@ async function main(argv) {
     const telegram = new TelegramDelegate({ store, adapter: tgAdapter,
       notificationAllowed: (job, snapshot, now) => policy.allow(job, snapshot, now),
       command: async text => { const result = policy.command(text); return result.recognized ? result.text : null; },
-      attachmentReader: job => attachmentBytes(job, store) });
+      attachmentReader: job => attachmentBytes(job, store),
+      transcribe: file => transcribeVoice(file, { store }) });
     bridge.disconnect('connecting');
     const silent = { level: 'silent', trace() {}, debug() {}, info() {}, warn() {}, error() {}, fatal() {}, child() { return this; } };
     const connect = () => {
