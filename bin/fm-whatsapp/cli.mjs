@@ -68,6 +68,14 @@ export function connectionDisposition(code, reasons) {
     .filter(Number.isFinite).includes(code) ? 'stop' : 'reconnect';
 }
 export function reconnectDelay(attempt) { return Math.min(60000, 1000 * 2 ** Math.min(attempt, 6)); }
+// Baileys only reconnects through a socket's `close` update, but a socket can
+// stall before `open` without ever emitting one: a non-101 handshake response
+// is claimed by Baileys' forwarded `unexpected-response` listener, so ws never
+// aborts and the attempt stays CONNECTING forever. A run bounds each attempt.
+export function connectStallMs(env = process.env) {
+  const override = Number(env.FM_WHATSAPP_CONNECT_STALL_MS);
+  return Number.isInteger(override) && override > 0 ? override : 60000;
+}
 export function safeHealth(state, now = epoch()) {
   let data = null;
   try { data = readJson(path.join(state, 'whatsapp/health.json')); } catch { data = null; }
@@ -507,7 +515,7 @@ async function main(argv) {
     process.stdout.write(`queued ${key}\n`); return;
   }
   const release = store.lock();
-  let socket, interval, reconnect, done, stopped = false, attempt = 0, qrShown = false;
+  let socket, interval, reconnect, stall, done, stopped = false, attempt = 0, qrShown = false;
   let serial = Promise.resolve();
   let pending = 0; let ticking = false;
   let bridge, mediaWork;
@@ -518,7 +526,7 @@ async function main(argv) {
   const stop = reason => {
     if (stopped) return;
     stopped = true;
-    clearInterval(interval); clearTimeout(reconnect);
+    clearInterval(interval); clearTimeout(reconnect); clearTimeout(stall);
     acknowledgements.disconnect();
     socket?.end(new Error('local bridge stopped'));
     clearQr();
@@ -591,13 +599,29 @@ async function main(argv) {
       transcribe: file => transcribeVoice(file, { store }) });
     bridge.disconnect('connecting');
     const silent = { level: 'silent', trace() {}, debug() {}, info() {}, warn() {}, error() {}, fatal() {}, child() { return this; } };
+    const retry = () => {
+      const delay = reconnectDelay(attempt++);
+      clearTimeout(reconnect);
+      reconnect = setTimeout(() => { try { connect(); } catch { log('connection failed'); stop('connection failed'); } }, delay);
+    };
     const connect = () => {
       if (stopped) return;
       const current = makeWASocket({ auth: auth.state, logger: silent, markOnlineOnConnect: false,
         syncFullHistory: false, shouldSyncHistoryMessage: () => false,
         browser: ['Firstmate', 'Desktop', '0.1.0'], connectTimeoutMs: 20000, defaultQueryTimeoutMs: 20000 });
       socket = current;
-      let currentState = 'connecting';
+      let currentState = 'connecting', abandoned = false;
+      clearTimeout(stall);
+      if (command === 'run') stall = setTimeout(() => {
+        if (socket !== current || stopped || currentState === 'open') return;
+        // Retire the stalled attempt ourselves; its late events are ignored.
+        abandoned = true;
+        log('WhatsApp connection attempt stalled; reconnecting');
+        try { Promise.resolve(current.end(new Error('connection attempt stalled'))).catch(() => {}); } catch { /* already ended */ }
+        acknowledgements.disconnect();
+        bridge.disconnect('disconnected; reconnect pending');
+        retry();
+      }, connectStallMs());
       current.ws.on('CB:ack,class:message', node => {
         if (socket === current && currentState === 'open' && !stopped) acknowledgements.observeNode(node);
       });
@@ -639,8 +663,11 @@ async function main(argv) {
         enqueue(() => bridge.processPending());
       });
       current.ev.on('connection.update', update => {
-        if (socket !== current || stopped) return;
+        if (socket !== current || stopped || abandoned) return;
         if (update.connection) currentState = update.connection;
+        // A QR or a terminal update proves the server answered; Baileys' own
+        // QR and keep-alive timers bound the attempt from here.
+        if (update.qr || update.connection === 'open' || update.connection === 'close') clearTimeout(stall);
         if (update.qr) {
           if (command !== 'pair') {
             // Decided without the token file: a transiently unreadable token is
@@ -698,11 +725,7 @@ async function main(argv) {
             } else {
               log('session is unavailable; stopped without deleting credentials'); stop('login required or connection replaced');
             }
-          } else {
-            const delay = reconnectDelay(attempt++);
-            clearTimeout(reconnect);
-            reconnect = setTimeout(() => { try { connect(); } catch { log('connection failed'); stop('connection failed'); } }, delay);
-          }
+          } else retry();
         }
       });
     };
@@ -738,7 +761,7 @@ async function main(argv) {
     await serial;
     await mediaWork;
   } finally {
-    stopped = true; clearInterval(interval); clearTimeout(reconnect);
+    stopped = true; clearInterval(interval); clearTimeout(reconnect); clearTimeout(stall);
     socket?.end(new Error('local bridge stopped'));
     clearQr();
     process.removeListener('SIGINT', onSignal); process.removeListener('SIGTERM', onSignal);

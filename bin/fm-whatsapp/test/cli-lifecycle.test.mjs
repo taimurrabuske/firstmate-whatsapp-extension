@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { connectionDisposition, reconnectDelay } from '../cli.mjs';
+import { connectionDisposition, connectStallMs, reconnectDelay } from '../cli.mjs';
 import { telegramConfigured } from '../telegram.mjs';
 import { Store, writeJson, readJson } from '../core.mjs';
 
@@ -65,6 +65,22 @@ test('an unconfigured fallback preserves the pairing-required shutdown', t => {
   assert.equal(summary.sent, 0);
   assert.equal(summary.telegramCalls.length, 0);
   assert.ok(!stderr.includes('Telegram remains available'));
+});
+
+test('a reconnect socket that stalls before open without a close update is retired and retried', t => {
+  const { summary } = runLifecycle(t, 'stalled-reconnect');
+  assert.ok(summary.timelineComplete);
+  assert.equal(summary.socketsBeforeStall, 2, 'the close must schedule exactly one reconnect socket');
+  assert.equal(summary.socketCount, 3, 'the stalled attempt must be retired and a new socket opened');
+  assert.ok(summary.cliLogs.some(line => line.includes('connection attempt stalled')));
+  assert.equal(summary.health?.connected, true, 'the bridge must reconnect instead of staying in reconnect pending');
+  assert.equal(summary.health?.problem, '');
+});
+
+test('connection stall bound defaults to one minute and accepts only a positive integer override', () => {
+  assert.equal(connectStallMs({}), 60000);
+  assert.equal(connectStallMs({ FM_WHATSAPP_CONNECT_STALL_MS: '1500' }), 1500);
+  for (const value of ['0', '-5', '1.5', 'soon', '']) assert.equal(connectStallMs({ FM_WHATSAPP_CONNECT_STALL_MS: value }), 60000);
 });
 
 test('connection disposition and reconnect backoff', () => {

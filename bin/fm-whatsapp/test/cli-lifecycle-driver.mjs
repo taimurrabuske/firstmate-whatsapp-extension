@@ -17,6 +17,7 @@ for (const dir of [home, code, state]) fs.mkdirSync(dir);
 process.env.FM_HOME = home; process.env.FM_CODE_ROOT = code; process.env.FM_STATE_OVERRIDE = state;
 process.env.FM_DELEGATE_STATE = path.join(base, 'delegate');
 process.umask(0o077);
+if (scenario === 'stalled-reconnect') process.env.FM_WHATSAPP_CONNECT_STALL_MS = '1500';
 
 const summary = {
   scenario, timelineComplete: false, socketCount: 0, sent: 0, outbox: 0,
@@ -107,6 +108,18 @@ if (scenario === 'startup-qr') {
   await sleep(1400); // reconnect timer (1s backoff) creates the second socket
   emit('connection.update', { qr: 'QR-3' });
   await sleep(3600); // interval tick services the fallback
+} else if (scenario === 'stalled-reconnect') {
+  // A connected run drops, and its reconnect socket stalls before open without
+  // ever emitting close (Baileys' non-101 handshake response). The stall bound
+  // must retire it and open a third socket that connects.
+  emit('connection.update', { connection: 'open' });
+  await sleep(300);
+  emit('connection.update', { connection: 'close', lastDisconnect: { error: { output: { statusCode: 428 } } } });
+  await sleep(1300); // 1s backoff creates the second socket, which stays silent
+  summary.socketsBeforeStall = summary.socketCount;
+  await sleep(1500 + 2300); // stall bound, then the next backoff creates a third socket
+  emit('connection.update', { connection: 'open' });
+  await sleep(3500); // interval tick republishes health
 } else if (scenario === 'logout') {
   // Connected run loses its linked session: QR challenge then a loggedOut close.
   emit('connection.update', { connection: 'open' });

@@ -191,6 +191,7 @@ Stopping preserves the linked session; unlink it from the phone to revoke it.
 The runtime can be supervised by an existing process manager using the same explicit environment.
 Do not launch a second copy against the same state directory.
 After an unclean shutdown or a reboot, `run` reclaims a `run.lock` whose recorded process has exited or was started before the current boot; a lock with no readable owner still needs manual inspection.
+A WhatsApp connection attempt that neither opens nor closes within one minute (for example, when the server answers the WebSocket handshake with an HTTP error) is retired and retried with the usual backoff, logging `WhatsApp connection attempt stalled; reconnecting`, so the bridge does not stay in `reconnect pending` forever.
 
 `./bin/fm-whatsapp.sh doctor` is a read-only diagnostic for operators and process managers.
 It classifies bridge health and recovery posture without connecting: connected versus disconnected transports, live versus stale single-instance lock ownership (including lock age and a lock recorded for another Firstmate home or private state directory, which usually means the service manager exports a mismatched `FM_HOME` or `FM_DELEGATE_STATE`), queued, pending, and uncertain request counts, handoff receipts left uncertain or mid-publication by an interrupted bridge, inbox wake adapter configuration and controller watcher beacon liveness, and fresh connected health that no live lock owns.
