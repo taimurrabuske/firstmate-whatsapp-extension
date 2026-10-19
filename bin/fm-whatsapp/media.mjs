@@ -5,9 +5,10 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { canonicalJid, privateDirectory, readJson, sameRoute, sha256, writeJson, truncateText, MAX_TEXT } from './core.mjs';
 import { VOICE_LIMITS } from './voice.mjs';
+import { describeVideoMedia, VIDEO_CONFIG_SCHEMA } from './video.mjs';
 
 export const MEDIA_LIMITS = Object.freeze({ image: 8 * 1024 * 1024, document: 15 * 1024 * 1024, voice: 10 * 1024 * 1024,
-  voiceSeconds: VOICE_LIMITS.maxSeconds, name: 120 });
+  video: 20 * 1024 * 1024, voiceSeconds: VOICE_LIMITS.maxSeconds, videoSeconds: VOICE_LIMITS.maxSeconds, name: 120 });
 const MIME = Object.freeze({
   '.jpg': ['image', 'image/jpeg'], '.jpeg': ['image', 'image/jpeg'], '.png': ['image', 'image/png'], '.webp': ['image', 'image/webp'],
   '.pdf': ['document', 'application/pdf'], '.txt': ['document', 'text/plain'], '.csv': ['document', 'text/csv'],
@@ -16,12 +17,18 @@ const MIME = Object.freeze({
 const INBOUND_MIME = new Map([
   ['image/jpeg', 'image'], ['image/png', 'image'], ['image/webp', 'image'],
   ['application/pdf', 'document'], ['text/plain', 'document'], ['text/csv', 'document'], ['application/json', 'document'],
-  ['audio/ogg', 'voice'], ['audio/ogg; codecs=opus', 'voice'], ['audio/mpeg', 'voice'], ['audio/mp4', 'voice']
+  ['audio/ogg', 'voice'], ['audio/ogg; codecs=opus', 'voice'], ['audio/mpeg', 'voice'], ['audio/mp4', 'voice'],
+  ['video/mp4', 'video'], ['video/quicktime', 'video'], ['video/webm', 'video']
 ]);
 
 /** The intake kind (image/document/voice) for an allowed inbound MIME type, or null. */
 export function inboundKind(mime) {
   return INBOUND_MIME.get(String(mime ?? '').toLowerCase()) ?? null;
+}
+/** A declared stream dimension must be a bounded positive integer or it is unknown (0). */
+export function positiveDimension(value) {
+  const result = number(value);
+  return Number.isSafeInteger(result) && result > 0 && result <= 100_000 ? result : 0;
 }
 /** A safe attachment display name, or the fallback when the offered name is unusable. */
 export function inboundName(value, fallback) { return safeName(value, fallback); }
@@ -51,6 +58,8 @@ function magicOkay(kind, mime, head) {
   if (kind === 'voice' && mime.startsWith('audio/ogg')) return head.subarray(0, 4).toString() === 'OggS';
   if (kind === 'voice' && mime === 'audio/mpeg') return head.subarray(0, 3).toString() === 'ID3' || (head[0] === 0xff && (head[1] & 0xe0) === 0xe0);
   if (kind === 'voice' && mime === 'audio/mp4') return head.subarray(4, 8).toString() === 'ftyp';
+  if (kind === 'video' && (mime === 'video/mp4' || mime === 'video/quicktime')) return head.length >= 8 && head.subarray(4, 8).toString() === 'ftyp';
+  if (kind === 'video' && mime === 'video/webm') return head.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]));
   if (['text/plain', 'text/csv', 'application/json'].includes(mime)) return !head.includes(0);
   return false;
 }
@@ -157,6 +166,38 @@ function number(value) {
   try { const result = Number(typeof value === 'object' && value !== null ? value.toString() : value); return Number.isSafeInteger(result) ? result : NaN; }
   catch { return NaN; }
 }
+function clockPosition(at) {
+  const seconds = Math.max(0, Math.round(Number(at) || 0));
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+}
+
+// Compose the bounded video detail block and stage its derived private files
+// (audio transcript and probe sidecar) beside the attachment. The block always
+// states what is present and what is not: frames are sampled stills, not
+// motion understanding, and every failure is explicit non-command text.
+function videoDetail(store, attachment, metadata, result) {
+  if (!result.available) return `\n${result.message}`;
+  const { info, frames, transcript } = result;
+  const dims = info.width > 0 && info.height > 0 ? `${info.width}x${info.height}` :
+    metadata.width > 0 && metadata.height > 0 ? `${metadata.width}x${metadata.height}` : 'unknown';
+  const lines = [`\nDuration: ${Math.max(1, Math.round(info.durationSeconds))}s; dimensions: ${dims}; audio track: ${info.hasAudio ? 'present' : 'absent'}.`];
+  if (frames.length) {
+    lines.push('Representative keyframes staged privately (sampled stills; motion between frames is not analyzed; read each image completely):');
+    frames.forEach((frame, index) => lines.push(`Frame ${index + 1} of ${frames.length} (at ${clockPosition(frame.at)}): ${frame.path}`));
+  } else lines.push('No representative keyframe could be extracted from this clip; the saved video remains available for inspection.');
+  if (transcript.available && typeof transcript.text === 'string' && transcript.text.trim() &&
+      transcript.text.length <= MAX_INBOUND_TRANSCRIPT &&
+      !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(transcript.text)) {
+    const transcriptFile = store.file(`attachments/incoming/${attachment.digest}.transcript.txt`);
+    fs.writeFileSync(transcriptFile, transcript.text, { mode: 0o600 });
+    lines.push(`Local transcript of the audio (read completely): ${transcriptFile}`);
+    lines.push(`Bounded transcript preview (start):\n${transcript.text.slice(0, 2200)}\nBounded transcript preview (end).`);
+  } else lines.push(transcript.available ? 'Audio transcription returned no usable text.' : transcript.message);
+  writeJson(store.file(`attachments/incoming/${attachment.digest}.video.json`), { schema: VIDEO_CONFIG_SCHEMA,
+    digest: attachment.digest, durationSeconds: Math.round(info.durationSeconds * 100) / 100, width: info.width, height: info.height,
+    hasAudio: info.hasAudio, codec: info.codec, frames: frames.map(frame => ({ path: frame.path, at: frame.at, bytes: frame.bytes })) });
+  return lines.join('\n');
+}
 function mediaEnvelope(message, identity, now, pairedAt, peer) {
   const key = message?.key, expectedFromMe = !peer;
   if (!identity || key?.fromMe !== expectedFromMe || typeof key.id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(key.id)) return null;
@@ -169,20 +210,24 @@ function mediaEnvelope(message, identity, now, pairedAt, peer) {
   if (!Number.isFinite(timestamp) || timestamp < pairedAt || timestamp < now - 86400 || timestamp > now + 300) return null;
   const content = message.message;
   if (!content) return null;
-  const mediaKeys = ['imageMessage', 'documentMessage', 'audioMessage'].filter(name => content[name]);
+  const mediaKeys = ['imageMessage', 'documentMessage', 'audioMessage', 'videoMessage'].filter(name => content[name]);
   if (mediaKeys.length !== 1 || Object.keys(content).some(name => ![mediaKeys[0], 'messageContextInfo'].includes(name))) return null;
   const body = content[mediaKeys[0]], context = body.contextInfo;
   if (body.viewOnce || context?.isForwarded || number(context?.forwardingScore) > 0) return null;
   if (context?.participant && !owns(context.participant) && !(peer && identity.aliases.includes(canonicalJid(context.participant)))) return null;
   if (context?.remoteJid && !owns(context.remoteJid)) return null;
   const mime = String(body.mimetype ?? '').toLowerCase(), kind = INBOUND_MIME.get(mime);
-  const expectedKind = mediaKeys[0] === 'imageMessage' ? 'image' : mediaKeys[0] === 'documentMessage' ? 'document' : 'voice';
+  const expectedKind = mediaKeys[0] === 'imageMessage' ? 'image' : mediaKeys[0] === 'documentMessage' ? 'document' :
+    mediaKeys[0] === 'videoMessage' ? 'video' : 'voice';
   const size = number(body.fileLength);
   if (kind !== expectedKind || !Number.isInteger(size) || size < 1 || size > MEDIA_LIMITS[kind]) return null;
-  const duration = kind === 'voice' ? number(body.seconds) : 0;
+  const duration = kind === 'voice' || kind === 'video' ? number(body.seconds) : 0;
   if (kind === 'voice' && (body.ptt !== true || !Number.isInteger(duration) || duration < 1 || duration > MEDIA_LIMITS.voiceSeconds)) return null;
+  if (kind === 'video' && (!Number.isInteger(duration) || duration < 1 || duration > MEDIA_LIMITS.videoSeconds)) return null;
   return { id: key.id, key: sha256(`${identity.account}\n${peer ? `${peer.account}\n` : ''}${key.id}`), kind, mime, size, duration,
-    name: safeName(body.fileName, kind === 'image' ? `image-${key.id}` : kind === 'voice' ? `voice-${key.id}` : `document-${key.id}`) };
+    width: positiveDimension(kind === 'video' ? body.width : 0), height: positiveDimension(kind === 'video' ? body.height : 0),
+    name: safeName(body.fileName, kind === 'image' ? `image-${key.id}` : kind === 'voice' ? `voice-${key.id}` :
+      kind === 'video' ? `video-${key.id}` : `document-${key.id}`) };
 }
 
 export function authenticateMediaMetadata(message, identity, now, pairedAt, peer = null) {
@@ -199,7 +244,7 @@ export async function stageInboundMedia(store, source, metadata) { return writeD
  * Surrogate request text for a staged inbound attachment, transcribing voice
  * locally through the injected transcriber. Shared by every transport.
  */
-export async function inboundMediaText(store, attachment, metadata, { transcribe, transport = 'WhatsApp', caption = '' } = {}) {
+export async function inboundMediaText(store, attachment, metadata, { transcribe, transport = 'WhatsApp', caption = '', video = null } = {}) {
   let detail = '';
   if (metadata.kind === 'voice') {
     const result = typeof transcribe === 'function' ? await transcribe(attachment.path, metadata) :
@@ -212,6 +257,9 @@ export async function inboundMediaText(store, attachment, metadata, { transcribe
         `Full private transcript (read completely): ${transcript}\n` +
         `Bounded transcript preview (start):\n${result.text.slice(0, 2200)}\nBounded transcript preview (end).`;
     } else detail = `\n${result?.message || 'Voice transcription returned no usable text.'}`;
+  } else if (metadata.kind === 'video') {
+    const result = await describeVideoMedia(store, attachment, { transcribe, ...(video ?? {}) });
+    detail = videoDetail(store, attachment, metadata, result);
   }
   const label = metadata.kind === 'voice' ? 'voice note' : metadata.kind;
   const captioned = caption ? `\nCaption from the paired person:\n${caption}` : '';
@@ -241,9 +289,9 @@ async function writeDownload(store, source, metadata) {
 }
 
 /** Authenticate metadata first, then invoke the injected Baileys downloader and return surrogate request text. */
-export async function authenticatedMediaMessage(message, identity, now, pairedAt, peer, { store, download, transcribe } = {}) {
+export async function authenticatedMediaMessage(message, identity, now, pairedAt, peer, { store, download, transcribe, video } = {}) {
   const metadata = mediaEnvelope(message, identity, now, pairedAt, peer);
   if (!metadata || typeof download !== 'function' || !store) return null;
   const attachment = await writeDownload(store, await download(message, metadata), metadata);
-  return { ...metadata, attachment, text: await inboundMediaText(store, attachment, metadata, { transcribe, transport: 'WhatsApp' }) };
+  return { ...metadata, attachment, text: await inboundMediaText(store, attachment, metadata, { transcribe, transport: 'WhatsApp', video }) };
 }
