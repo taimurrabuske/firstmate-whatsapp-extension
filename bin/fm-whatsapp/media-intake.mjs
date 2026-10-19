@@ -41,8 +41,8 @@ export function sweepStaleTemporaries(store, { now = epoch(), maxAgeSeconds = TE
 }
 
 export class MediaIntake {
-  constructor({ store, bridge, encode, decode, download, transcribe, clock = epoch }) {
-    Object.assign(this, { store, bridge, encode, decode, download, transcribe, clock });
+  constructor({ store, bridge, encode, decode, download, transcribe, video, clock = epoch }) {
+    Object.assign(this, { store, bridge, encode, decode, download, transcribe, video, clock });
     privateDirectory(store.file('media-pending'));
     sweepStaleTemporaries(store, { now: this.clock() });
   }
@@ -76,7 +76,7 @@ export class MediaIntake {
         const message = this.decode(Buffer.from(job.encoded, 'base64'));
         if (this.store.sentByRemoteId(message.key?.id)) { fs.unlinkSync(file); continue; } // our own outbound echo
         const accepted = await authenticatedMediaMessage(message, this.bridge.identity, this.clock(), this.bridge.pairedAt,
-          this.bridge.peer, { store: this.store, download: this.download, transcribe: this.transcribe });
+          this.bridge.peer, { store: this.store, download: this.download, transcribe: this.transcribe, video: this.video });
         if (!accepted) throw new Error('media no longer eligible');
         if (!this.bridge.connected) return; // Keep the durable locator for the next connected pass.
         this.bridge.stage({ type: 'notify', messages: [{ ...message, message: { conversation: accepted.text } }] });

@@ -84,7 +84,9 @@ export function retainPrivateState(store, requests = null, { now = epoch(), seco
   // Attachment content past the horizon that nothing unresolved references.
   // Undelivered queue entries protect their staged attachment by digest, and
   // any pending job, handoff envelope, or journaled request text protects the
-  // exact paths it names (including transcripts) no matter how old they are.
+  // exact paths it names (including transcripts, keyframes and probe sidecars)
+  // no matter how old they are. A video attachment and its derived files are
+  // one family: referencing any member protects every member.
   const protectedDigests = new Set(), protectedBodies = [];
   for (const name of store.records('outbox')) {
     const { record: job } = readStoredRecord(store.root, store.file(`outbox/${name}`));
@@ -101,14 +103,26 @@ export function retainPrivateState(store, requests = null, { now = epoch(), seco
     }
   }
   for (const bucket of ['attachments/outgoing', 'attachments/incoming']) {
-    for (const digest of listBucket(store, bucket).filter(DIGEST)) {
+    const entries = listBucket(store, bucket);
+    for (const digest of entries.filter(DIGEST)) {
       const blob = store.file(`${bucket}/${digest}`);
       const stat = safeStat(blob);
       if (!stat?.isFile() || stat.isSymbolicLink() || stat.mtimeMs / 1000 >= horizon) continue;
-      const transcript = `${blob}.transcript.txt`;
-      if (protectedDigests.has(digest) || protectedBodies.some(body => body.includes(blob) || body.includes(transcript))) continue;
-      for (const file of [blob, `${blob}.json`, transcript]) fs.rmSync(file, { force: true });
+      const family = [blob, `${blob}.json`, `${blob}.transcript.txt`, `${blob}.video.json`,
+        ...entries.filter(name => name.startsWith(`${digest}.frame-`)).map(name => store.file(`${bucket}/${name}`))];
+      if (protectedDigests.has(digest) || protectedBodies.some(body => family.some(file => body.includes(file)))) continue;
+      for (const file of family) fs.rmSync(file, { force: true });
       report.attachments++;
+    }
+    // Derived video artifacts whose blob is already gone (interrupted family
+    // cleanup) still age out; nothing else in the bucket matches these names.
+    const digests = new Set(entries.filter(DIGEST));
+    for (const name of entries.filter(name => /^[a-f0-9]{64}\.(frame-\d+\.jpg|video\.json)$/.test(name))) {
+      if (digests.has(name.slice(0, 64))) continue;
+      const file = store.file(`${bucket}/${name}`);
+      const stat = safeStat(file);
+      if (!stat?.isFile() || stat.isSymbolicLink() || stat.mtimeMs / 1000 >= horizon) continue;
+      fs.rmSync(file, { force: true });
     }
   }
 

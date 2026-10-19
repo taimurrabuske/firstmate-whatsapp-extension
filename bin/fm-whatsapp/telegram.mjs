@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { readJson, readStoredRecord, queuedJobShape, writeJson, privateDirectory, sha256, epoch, validText, parseRequest, PREFIX, sameRoute, plainRecord,
   truncateText, outboundOrder, REMOTE_HELP } from './core.mjs';
-import { MEDIA_LIMITS, inboundKind, inboundName, stageInboundMedia, inboundMediaText } from './media.mjs';
+import { MEDIA_LIMITS, inboundKind, inboundName, positiveDimension, stageInboundMedia, inboundMediaText } from './media.mjs';
 
 // Telegram's Bot API serves downloads of at most 20 MB; every local limit is lower.
 const FILE_ID = /^[A-Za-z0-9_-]{1,256}$/;
@@ -154,6 +154,16 @@ function telegramMedia(message) {
         body.file_size < 1 || body.file_size > MEDIA_LIMITS[kind]) return null;
     return { kind, mime, fileId: body.file_id, size: body.file_size, duration: 0, name: inboundName(body.file_name, `document-TG_${id}`) };
   }
+  if (field === 'video' || field === 'video_note') {
+    const body = message[field], mime = String(body.mime_type ?? 'video/mp4').toLowerCase();
+    if (inboundKind(mime) !== 'video' || !FILE_ID.test(body.file_id ?? '') || !Number.isInteger(body.file_size) ||
+        body.file_size < 1 || body.file_size > MEDIA_LIMITS.video ||
+        !Number.isInteger(body.duration) || body.duration < 1 || body.duration > MEDIA_LIMITS.videoSeconds) return null;
+    return { kind: 'video', mime, fileId: body.file_id, size: body.file_size, duration: body.duration,
+      width: positiveDimension(body.width), height: positiveDimension(body.height),
+      name: inboundName(body.file_name, `${field === 'video_note' ? 'video-note' : 'video'}-TG_${id}${
+        mime === 'video/webm' ? '.webm' : mime === 'video/quicktime' ? '.mov' : '.mp4'}`) };
+  }
   return null;
 }
 
@@ -179,8 +189,8 @@ export function authenticatedTelegram(update, config, now = epoch()) {
 
 export class TelegramDelegate {
   constructor({ store, adapter, clientFactory = config => new TelegramClient(config), clock = epoch, attachmentReader,
-    notificationAllowed = () => true, command = async () => null, transcribe }) {
-    Object.assign(this, { store, adapter, clientFactory, clock, attachmentReader, notificationAllowed, command, transcribe });
+    notificationAllowed = () => true, command = async () => null, transcribe, video }) {
+    Object.assign(this, { store, adapter, clientFactory, clock, attachmentReader, notificationAllowed, command, transcribe, video });
     this.lastPoll = 0;
   }
   // Download, stage and describe one pending media job in place, so the rest of
@@ -189,11 +199,12 @@ export class TelegramDelegate {
   // person is told once and the job retires.
   async resolveMedia(job, file, client) {
     try {
-      const metadata = { kind: job.media.kind, mime: job.media.mime, size: job.media.size, duration: job.media.duration, name: job.media.name };
+      const metadata = { kind: job.media.kind, mime: job.media.mime, size: job.media.size, duration: job.media.duration,
+        width: job.media.width ?? 0, height: job.media.height ?? 0, name: job.media.name };
       const source = await client.download(job.media.fileId, MEDIA_LIMITS[metadata.kind]);
       const attachment = await stageInboundMedia(this.store, source, metadata);
       job.text = await inboundMediaText(this.store, attachment, metadata,
-        { transcribe: this.transcribe, transport: 'Telegram', caption: job.caption ?? '' });
+        { transcribe: this.transcribe, transport: 'Telegram', caption: job.caption ?? '', video: this.video });
       job.attachment = { digest: attachment.digest, path: attachment.path };
       delete job.media;
       writeJson(file, job);
