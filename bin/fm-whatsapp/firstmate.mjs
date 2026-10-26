@@ -226,19 +226,27 @@ export class FirstmateAdapter {
       // One damaged receipt must not silence maintenance for every other request.
       const receipt = readStoredRecord(this.store.root, file).record;
       if (!receipt?.id || !['saved', 'handled'].includes(receipt.phase) || !sameRoute(receipt.route, current)) continue;
-      const found = this.findNote(name.slice(0, -5), receipt.body);
-      if (found?.handled) {
-        if (receipt.phase !== 'handled') { receipt.phase = 'handled'; writeJson(file, receipt); }
-        const request = this.requests.get(name.slice(0, -5));
-        if (request?.state === 'received') this.requests.transition(request.key, 'picked-up', 'Firstmate inbox recorded handling.');
+      const requestKey = name.slice(0, -5);
+      const request = this.requests.get(requestKey);
+      // A durable handled acknowledgement outlives the physical note: inbox
+      // retention prunes handled notes after 30 days, so re-verifying the disk
+      // would treat pruned-but-handled work as unacknowledged and re-ring and
+      // re-alert it forever. Handled receipts never re-verify; a handled note
+      // still found on disk keeps upgrading a saved receipt in place.
+      if (receipt.phase === 'handled') {
+        if (request?.state === 'received') this.requests.transition(requestKey, 'picked-up', 'Firstmate inbox recorded handling.');
         continue;
       }
-      const request = this.requests.get(name.slice(0, -5));
+      const found = this.findNote(requestKey, receipt.body);
+      if (found?.handled) {
+        receipt.phase = 'handled'; writeJson(file, receipt);
+        if (request?.state === 'received') this.requests.transition(requestKey, 'picked-up', 'Firstmate inbox recorded handling.');
+        continue;
+      }
       if (request && ['picked-up', 'working', 'completed', 'failed'].includes(request.state)) continue;
       if (request?.state === 'waiting' && !/^(controller has not acknowledged|wake failed)/.test(request.history.at(-1)?.text ?? '')) continue;
       const maintenance = receipt.maintenance ?? { rings: 0, last: 0 };
       if (now - (receipt.created ?? now) < staleAfter || now - maintenance.last < staleAfter) continue;
-      const requestKey = name.slice(0, -5);
       const markWaiting = evidence => {
         const request = this.requests.get(requestKey);
         if (request && request.state !== 'waiting' && !['completed', 'failed'].includes(request.state))
