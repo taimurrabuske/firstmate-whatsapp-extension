@@ -156,6 +156,39 @@ test('maintenance only re-rings an existing stale note with a strict bound and r
   assert.equal(adapter.requests.get(key).state, 'waiting'); // Inbox handling is not evidence that stalled work resumed.
 });
 
+test('durable handled receipts stay silent after their notes are pruned; unhandled notes still alert', async t => {
+  const f = fixture(t), calls = [], route = { account: '15555550123@s.whatsapp.net', recipient: '15555550123@s.whatsapp.net' };
+  writeJson(f.store.file('identity.json'), { account: route.account, pairedAt: 1 });
+  const adapter = new FirstmateAdapter({ ...f.options, run: async (file, args) => { calls.push({ file, args }); return ''; } });
+  const binding = { home: fs.realpathSync(f.home), codeRoot: path.resolve(f.options.codeRoot), state: path.resolve(f.options.state) };
+  const handledKey = sha256('handled request'), unhandledKey = sha256('unhandled request');
+  adapter.requests.receive(handledKey, { route, text: 'handled long ago' });
+  adapter.requests.transition(handledKey, 'waiting', 'controller has not acknowledged; watcher beacon is 301s old');
+  writeJson(f.store.file(`handoffs/${handledKey}.json`), { id: 'note-old', body: adapter.envelope(handledKey, 'handled long ago'),
+    phase: 'handled', route, created: 1, binding, maintenance: { rings: 3, last: 1 } }); // Note pruned by 30-day retention.
+  adapter.requests.receive(unhandledKey, { route, text: 'never picked up' });
+  const unhandledBody = adapter.envelope(unhandledKey, 'never picked up'); saveNote(f, unhandledBody, 'note-live');
+  writeJson(f.store.file(`handoffs/${unhandledKey}.json`), { id: 'note-live', body: unhandledBody, phase: 'saved', route,
+    created: 1, binding, maintenance: { rings: 0, last: 0 } });
+  fs.mkdirSync(f.options.state, { recursive: true });
+  const beat = path.join(f.options.state, '.last-watcher-beat'); fs.writeFileSync(beat, ''); fs.utimesSync(beat, 1, 1);
+  const receiptBytes = fs.readFileSync(f.store.file(`handoffs/${handledKey}.json`), 'utf8');
+  const reports = await adapter.maintain({ now: 100000, staleAfter: 300, maxRings: 3 });
+  assert.deepEqual(reports.map(report => report.key), [unhandledKey]); // Pruned handled work raises no report at exhausted rings.
+  assert.deepEqual(calls.map(call => call.args.at(-2)), ['inbox:note-live']); // Only the genuinely unhandled note re-rings.
+  assert.equal(adapter.requests.get(handledKey).state, 'waiting'); // Handled ingestion is not completion.
+  assert.equal(fs.readFileSync(f.store.file(`handoffs/${handledKey}.json`), 'utf8'), receiptBytes);
+  adapter.notifyMaintenance(reports[0]);
+  assert.equal(f.store.records('outbox').length, 1); // No re-notification exists for the handled receipt.
+  // Freeze the unhandled control by timing so the handled receipt is the only variable.
+  writeJson(f.store.file(`handoffs/${unhandledKey}.json`), { id: 'note-live', body: unhandledBody, phase: 'saved', route,
+    created: 1, binding, maintenance: { rings: 1, last: 200000 } });
+  writeJson(f.store.file(`handoffs/${handledKey}.json`), { ...JSON.parse(receiptBytes), maintenance: { rings: 2, last: 1 } });
+  assert.deepEqual(await adapter.maintain({ now: 200000, staleAfter: 300, maxRings: 3 }), []); // Budget is not spent on handled work.
+  assert.deepEqual(calls.map(call => call.args.at(-2)), ['inbox:note-live']);
+  assert.equal(adapter.requests.get(handledKey).state, 'waiting');
+});
+
 test('read-only decision helper works without AFK or extension enablement', t => {
   const f = fixture(t), code = path.join(f.base, 'decision-code'), bin = path.join(code, 'bin');
   fs.mkdirSync(bin, { recursive: true }); fs.mkdirSync(f.options.state, { recursive: true });
