@@ -2,7 +2,7 @@
 // Deletion policy, in one place: only proven terminal artifacts are removed
 // (handled handoffs of terminal requests, terminal request records, and
 // attachment content past the horizon that no unresolved record still
-// references). Open requests, uncertain handoffs, pending replies, and
+// references, and retained failed Telegram media jobs past the horizon). Open requests, uncertain handoffs, pending replies, and
 // undelivered queue entries are never deleted; send-receipt expiry stays in
 // `Store.pruneSent` on its own 24-hour boundary. Damaged or incompatible
 // records are never deleted at all: readers quarantine them byte-preserved.
@@ -18,7 +18,7 @@ const HEX_JSON = name => /^[a-f0-9]{64}\.json$/.test(name);
 const DIGEST = name => /^[a-f0-9]{64}$/.test(name);
 // Buckets whose writeJson/enqueue staging leaves `.tmp` litter after a crash.
 // `auth` is intentionally absent: the transport owns those files.
-const LITTER_BUCKETS = ['outbox', 'pending', 'media-pending', 'telegram-pending', 'sent', 'incoming', 'handoffs', 'requests'];
+const LITTER_BUCKETS = ['outbox', 'pending', 'media-pending', 'telegram-pending', 'telegram-media-failed', 'sent', 'incoming', 'handoffs', 'requests'];
 
 function listBucket(store, bucket) {
   try { return fs.readdirSync(store.file(bucket)); } catch { return []; }
@@ -52,7 +52,7 @@ export function quarantineSummary(root) {
  */
 export function retainPrivateState(store, requests = null, { now = epoch(), seconds = RETENTION.seconds } = {}) {
   const horizon = now - seconds;
-  const report = { handoffs: 0, requests: 0, attachments: 0, temporaries: 0 };
+  const report = { handoffs: 0, requests: 0, attachments: 0, mediaFailures: 0, temporaries: 0 };
 
   if (requests) {
     // Handoff receipts of terminal requests whose inbox note Firstmate handled.
@@ -79,6 +79,16 @@ export function retainPrivateState(store, requests = null, { now = epoch(), seco
       fs.unlinkSync(file);
       report.requests++;
     }
+  }
+
+  // Failed Telegram media jobs are terminal diagnostics kept for inspection;
+  // they go once past the horizon. A record without a valid failure time stays.
+  for (const name of listBucket(store, 'telegram-media-failed').filter(HEX_JSON)) {
+    const file = store.file(`telegram-media-failed/${name}`);
+    const { record } = readStoredRecord(store.root, file);
+    if (!Number.isFinite(record?.failedAt) || record.failedAt >= horizon) continue;
+    fs.unlinkSync(file);
+    report.mediaFailures++;
   }
 
   // Attachment content past the horizon that nothing unresolved references.

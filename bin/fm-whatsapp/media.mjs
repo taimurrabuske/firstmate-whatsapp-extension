@@ -43,6 +43,8 @@ function safeName(value, fallback) {
       /[\u0000-\u001f\u007f]/.test(name) || name !== value) return fallback;
   return name;
 }
+// Inbound failures name their stage so the transport can say what happened.
+const stagedError = (message, stage) => Object.assign(new Error(message), { stage });
 function regularOpen(file) {
   const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
   const fd = fs.openSync(file, flags);
@@ -75,7 +77,7 @@ function atomicCopyFromFd(store, fd, { bucket, kind, mime, name, maximum }) {
       const read = fs.readSync(fd, chunk, 0, chunk.length, offset);
       if (!read) break;
       offset += read; size += read;
-      if (size > maximum) throw new Error('attachment exceeds size limit');
+      if (size > maximum) throw stagedError('attachment exceeds size limit', 'size-over-limit');
       if (headLength < head.length) { const count = Math.min(read, head.length - headLength); chunk.copy(head, headLength, 0, count); headLength += count; }
       hash.update(chunk.subarray(0, read));
       if (fs.writeSync(out, chunk, 0, read) !== read) throw new Error('attachment staging write interrupted');
@@ -83,7 +85,7 @@ function atomicCopyFromFd(store, fd, { bucket, kind, mime, name, maximum }) {
     fs.fsyncSync(out);
   } catch (error) { fs.closeSync(out); fs.rmSync(temp, { force: true }); throw error; }
   fs.closeSync(out);
-  if (!size || !magicOkay(kind, mime, head.subarray(0, headLength))) { fs.rmSync(temp, { force: true }); throw new Error('attachment content does not match allowed MIME type'); }
+  if (!size || !magicOkay(kind, mime, head.subarray(0, headLength))) { fs.rmSync(temp, { force: true }); throw stagedError('attachment content does not match allowed MIME type', 'content-mismatch'); }
   const digest = hash.digest('hex');
   const target = store.file(`attachments/${bucket}/${digest}`);
   try { fs.linkSync(temp, target); } catch (error) { if (error.code !== 'EEXIST') { fs.rmSync(temp, { force: true }); throw error; } }
@@ -272,16 +274,16 @@ async function writeDownload(store, source, metadata) {
   let size = 0;
   try {
     const iterable = Buffer.isBuffer(source) ? [source] : source;
-    if (!iterable || typeof iterable[Symbol.asyncIterator] !== 'function' && typeof iterable[Symbol.iterator] !== 'function') throw new Error('media downloader returned no byte stream');
+    if (!iterable || typeof iterable[Symbol.asyncIterator] !== 'function' && typeof iterable[Symbol.iterator] !== 'function') throw stagedError('media downloader returned no byte stream', 'download-empty');
     for await (const value of iterable) {
       const chunk = Buffer.from(value); size += chunk.length;
-      if (size > metadata.size || size > MEDIA_LIMITS[metadata.kind]) throw new Error('download exceeded declared media size');
+      if (size > metadata.size || size > MEDIA_LIMITS[metadata.kind]) throw stagedError('download exceeded declared media size', 'size-over-declared');
       if (fs.writeSync(fd, chunk, 0, chunk.length) !== chunk.length) throw new Error('media download write interrupted');
     }
     fs.fsyncSync(fd);
   } catch (error) { fs.closeSync(fd); fs.rmSync(temp, { force: true }); throw error; }
   fs.closeSync(fd);
-  if (size !== metadata.size) { fs.rmSync(temp, { force: true }); throw new Error('download size did not match authenticated metadata'); }
+  if (size !== metadata.size) { fs.rmSync(temp, { force: true }); throw stagedError('download size did not match authenticated metadata', 'size-mismatch'); }
   const opened = regularOpen(temp);
   try { return atomicCopyFromFd(store, opened.fd, { bucket: 'incoming', kind: metadata.kind, mime: metadata.mime,
     name: metadata.name, maximum: MEDIA_LIMITS[metadata.kind] }); }

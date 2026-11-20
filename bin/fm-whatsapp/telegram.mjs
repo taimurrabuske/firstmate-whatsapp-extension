@@ -9,7 +9,34 @@ import { MEDIA_LIMITS, inboundKind, inboundName, positiveDimension, stageInbound
 const FILE_ID = /^[A-Za-z0-9_-]{1,256}$/;
 const FILE_PATH = /^[A-Za-z0-9_-]+(\/[A-Za-z0-9_.-]+)*$/;
 const MEDIA_ATTEMPTS = 3;
-const MEDIA_FAILED = 'I could not process that attachment locally. It is retained privately where it was received; send the request as text or resend the attachment.';
+const MEDIA_FAILURES_KEPT = 5;
+// Media failures carry a stage from a closed vocabulary of lowercase words,
+// HTTP statuses and Bot API error codes. Remote descriptions, URLs and tokens
+// never become part of a stage, so stages are safe to persist, log and reply with.
+const STAGE = /^[a-z][a-z0-9-]{0,47}$/;
+// Known Bot API refusal descriptions, reduced to a closed reason; the remote text itself is never kept.
+const REFUSALS = [[/file is too big/i, 'too-big'], [/temporarily unavailable/i, 'temporarily-unavailable'],
+  [/file_id/i, 'invalid-file-id'], [/too many requests/i, 'rate-limited']];
+
+/** A Telegram transport failure whose `stage` names where it happened and never carries secrets. */
+export class TelegramFailure extends Error {
+  constructor(message, stage) { super(message); this.stage = STAGE.test(stage ?? '') ? stage : 'unknown'; }
+}
+const timedOut = error => error?.name === 'TimeoutError';
+
+// The person's reply after the final failed attempt says what actually happened:
+// a download failure kept nothing, a content mismatch was refused, and only a
+// failure after staging leaves the download retained.
+function mediaFailedText(stage, retained) {
+  if (/^(getfile|file-|download)/.test(stage)) return `I could not download that attachment from Telegram (${stage}), so nothing was saved here. Please resend it, or send the request as text.`;
+  if (/^(size|content)-/.test(stage)) return `That attachment did not match what Telegram declared for it (${stage}), so it was refused and not kept. Please resend it, or send the request as text.`;
+  return `I downloaded that attachment but could not prepare it locally (${stage}).${retained ? ' The download is retained privately for inspection.' : ''} Please resend it, or send the request as text.`;
+}
+function failureStage(phase, error) {
+  if (typeof error?.stage === 'string' && STAGE.test(error.stage)) return error.stage;
+  if (timedOut(error)) return `${phase}-timeout`;
+  return phase === 'download' ? 'download-unknown' : phase === 'stage' ? 'stage-io' : 'describe-failed';
+}
 
 function tokenAt(file) {
   if (!path.isAbsolute(file)) throw new Error('Telegram token file must be absolute');
@@ -57,20 +84,31 @@ export function telegramStore(store) {
 }
 
 export class TelegramClient {
-  constructor(config, fetcher = fetch) { this.config = config; this.fetcher = fetcher; }
+  constructor(config, fetcher = fetch, { timeouts = {} } = {}) {
+    this.config = config; this.fetcher = fetcher; this.timeouts = { request: 15000, download: 60000, ...timeouts };
+  }
   async call(method, data) {
     const multipart = data instanceof FormData;
+    let stage = 'network';
     try {
       const response = await this.fetcher(`https://api.telegram.org/bot${this.config.token}/${method}`, {
         method: 'POST', headers: multipart ? undefined : { 'content-type': 'application/json' },
-        body: multipart ? data : JSON.stringify(data), signal: AbortSignal.timeout(15000), redirect: 'error' });
-      if (!response.ok) throw new Error('unavailable');
-      const text = await response.text();
-      if (text.length > 2_000_000) throw new Error('oversized');
-      const result = JSON.parse(text);
-      if (result.ok !== true) throw new Error('refused');
+        body: multipart ? data : JSON.stringify(data), signal: AbortSignal.timeout(this.timeouts.request), redirect: 'error' });
+      const text = typeof response?.text === 'function' ? await response.text() : '';
+      if (text.length > 2_000_000) { stage = 'oversized-response'; throw new Error('oversized'); }
+      let result = null;
+      try { result = JSON.parse(text); } catch { result = null; }
+      if (!response.ok || result?.ok !== true) {
+        const code = Number.isSafeInteger(result?.error_code) ? result.error_code : Number.isSafeInteger(response.status) ? response.status : 0;
+        const reason = typeof result?.description === 'string' ? REFUSALS.find(([pattern]) => pattern.test(result.description))?.[1] : undefined;
+        stage = `refused-${Math.abs(code)}${reason ? `-${reason}` : ''}`;
+        throw new Error('refused');
+      }
       return result.result;
-    } catch { throw new Error('Telegram request failed; details omitted'); }
+    } catch (error) {
+      if (timedOut(error)) stage = 'timeout';
+      throw new TelegramFailure('Telegram request failed; details omitted', `${method.toLowerCase()}-${stage}`);
+    }
   }
   updates(offset) { return this.call('getUpdates', { offset, timeout: 0, limit: 50, allowed_updates: ['message'] }); }
   /**
@@ -78,17 +116,27 @@ export class TelegramClient {
    * never returned, persisted or included in an error.
    */
   async download(fileId, maximum) {
-    if (!FILE_ID.test(fileId ?? '') || !Number.isInteger(maximum) || maximum < 1) throw new Error('invalid Telegram file request');
+    if (!FILE_ID.test(fileId ?? '') || !Number.isInteger(maximum) || maximum < 1) throw new TelegramFailure('invalid Telegram file request', 'file-request-invalid');
     const file = await this.call('getFile', { file_id: fileId });
-    if (typeof file?.file_path !== 'string' || !FILE_PATH.test(file.file_path) || file.file_path.split('/').includes('..') ||
-        !Number.isInteger(file.file_size) || file.file_size < 1 || file.file_size > maximum) throw new Error('Telegram file unavailable or oversized');
+    const unavailable = stage => new TelegramFailure('Telegram file unavailable or oversized', stage);
+    if (typeof file?.file_path !== 'string' || !FILE_PATH.test(file.file_path) || file.file_path.split('/').includes('..')) throw unavailable('file-metadata-path');
+    if (file.file_size == null) throw unavailable('file-metadata-size-missing');
+    if (!Number.isInteger(file.file_size) || file.file_size < 1) throw unavailable('file-metadata-size-invalid');
+    if (file.file_size > maximum) throw unavailable('file-metadata-size-over');
+    const failed = stage => new TelegramFailure('Telegram download failed; details omitted', stage);
     let response;
     try {
       response = await this.fetcher(`https://api.telegram.org/file/bot${this.config.token}/${file.file_path}`,
-        { method: 'GET', signal: AbortSignal.timeout(60000), redirect: 'error' });
-    } catch { throw new Error('Telegram download failed; details omitted'); }
-    if (!response?.ok || !response.body) throw new Error('Telegram download failed; details omitted');
-    return response.body;
+        { method: 'GET', signal: AbortSignal.timeout(this.timeouts.download), redirect: 'error' });
+    } catch (error) { throw failed(timedOut(error) ? 'download-timeout' : 'download-network'); }
+    if (!response?.ok) throw failed(`download-http-${Number.isSafeInteger(response?.status) ? Math.abs(response.status) : 0}`);
+    if (!response.body) throw failed('download-empty');
+    // Errors while the body streams are classified too, never passed through raw.
+    const body = response.body;
+    return (async function* stream() {
+      try { for await (const chunk of body) yield chunk; }
+      catch (error) { throw failed(timedOut(error) ? 'download-stream-timeout' : 'download-stream'); }
+    })();
   }
   async send(text, attachment) {
     let result;
@@ -125,11 +173,11 @@ export async function configureTelegram(store, tokenFile, userId, { fetcher = fe
     whatsappRoute: store.currentRoute() });
 }
 
+const MEDIA_FIELDS = ['voice', 'audio', 'photo', 'document', 'video', 'video_note', 'animation', 'sticker', 'contact', 'location', 'venue', 'poll', 'dice'];
 // Exactly one supported media field, validated against the same limits and
 // MIME allowlist WhatsApp media uses. Returns null for anything else.
 function telegramMedia(message) {
-  const fields = ['voice', 'audio', 'photo', 'document', 'video', 'video_note', 'animation', 'sticker', 'contact', 'location', 'venue', 'poll', 'dice']
-    .filter(name => message[name] != null);
+  const fields = MEDIA_FIELDS.filter(name => message[name] != null);
   if (fields.length !== 1) return null;
   const field = fields[0], id = message.message_id;
   if (field === 'voice' || field === 'audio') {
@@ -167,14 +215,21 @@ function telegramMedia(message) {
   return null;
 }
 
+// The paired person in the paired private chat, inside the acceptance date window.
+function fromPairedPerson(update, config, now) {
+  const message = update?.message;
+  return Number.isSafeInteger(update?.update_id) && Number.isSafeInteger(message?.message_id) &&
+    message.chat?.type === 'private' && String(message.chat.id) === config.chatId &&
+    String(message.from?.id) === config.userId && !message.from?.is_bot &&
+    Number.isInteger(message.date) && message.date >= config.enabledAt && message.date >= now - 86400 && message.date <= now + 300;
+}
+const telegramKey = (route, messageId) => sha256(`telegram\n${JSON.stringify(route)}\n${messageId}`);
+
 export function authenticatedTelegram(update, config, now = epoch()) {
   const message = update?.message;
-  if (!Number.isSafeInteger(update?.update_id) || !Number.isSafeInteger(message?.message_id) ||
-      message.chat?.type !== 'private' || String(message.chat.id) !== config.chatId ||
-      String(message.from?.id) !== config.userId || message.from?.is_bot ||
-      message.forward_origin || message.forward_date || message.sender_chat || message.via_bot ||
-      !Number.isInteger(message.date) || message.date < config.enabledAt || message.date < now - 86400 || message.date > now + 300) return null;
-  const identity = { key: sha256(`telegram\n${JSON.stringify(config.route)}\n${message.message_id}`),
+  if (!fromPairedPerson(update, config, now) ||
+      message.forward_origin || message.forward_date || message.sender_chat || message.via_bot) return null;
+  const identity = { key: telegramKey(config.route, message.message_id),
     remoteId: `TG_${message.message_id}`, quotedId: message.reply_to_message ? `TG_${message.reply_to_message.message_id}` : null };
   if (message.text != null) {
     if (!validText(message.text) || message.text.startsWith(PREFIX)) return null;
@@ -187,40 +242,131 @@ export function authenticatedTelegram(update, config, now = epoch()) {
   return { ...identity, text: '', caption, media };
 }
 
+// Content the person composed that has no media field above; anything else
+// without text or media is a service event (pins, settings) and stays silent.
+const OTHER_CONTENT = ['story', 'paid_media', 'checklist', 'game', 'invoice', 'giveaway'];
+// Why a paired-person media message was refused, as a closed reason, or null for a service event.
+function mediaRejection(message) {
+  const fields = MEDIA_FIELDS.filter(name => message[name] != null);
+  if (!fields.length) return OTHER_CONTENT.some(name => message[name] != null) ? 'unsupported' : null;
+  if (fields.length !== 1) return 'unsupported';
+  const field = fields[0], body = message[field];
+  if (!['voice', 'audio', 'photo', 'document', 'video', 'video_note'].includes(field) || body === null || typeof body !== 'object') return 'unsupported';
+  if (field === 'photo') {
+    const sizes = Array.isArray(body) ? body.map(size => size?.file_size).filter(Number.isInteger) : [];
+    return sizes.length && Math.min(...sizes) > MEDIA_LIMITS.image ? 'too-large' : 'unsupported';
+  }
+  const fallback = field === 'voice' ? 'audio/ogg' : field === 'video' || field === 'video_note' ? 'video/mp4' : '';
+  const mime = String(body.mime_type ?? fallback).toLowerCase(), kind = inboundKind(mime);
+  if (field === 'document') {
+    if (mime.startsWith('audio/')) return 'audio-as-file';
+    if (mime.startsWith('video/')) return 'video-as-file';
+    if (!['image', 'document'].includes(kind)) return 'file-format';
+  }
+  if ((field === 'voice' || field === 'audio') && kind !== 'voice') return 'audio-format';
+  if ((field === 'video' || field === 'video_note') && kind !== 'video') return 'video-format';
+  if (Number.isInteger(body.file_size) && body.file_size > MEDIA_LIMITS[kind]) return 'too-large';
+  if (field !== 'document' && Number.isInteger(body.duration)) {
+    if (body.duration < 1) return 'too-short';
+    if (body.duration > (kind === 'video' ? MEDIA_LIMITS.videoSeconds : MEDIA_LIMITS.voiceSeconds)) return 'too-long';
+  }
+  return 'unsupported';
+}
+
+/**
+ * For an update that authenticatedTelegram refused, the closed reason to
+ * explain once to the paired person, or null to stay silent: anyone else, a
+ * message outside the date window, and our own prefixed text are never answered.
+ */
+export function pairedRejection(update, config, now = epoch()) {
+  if (!fromPairedPerson(update, config, now) || authenticatedTelegram(update, config, now)) return null;
+  const message = update.message;
+  if (message.forward_origin || message.forward_date || message.sender_chat) return 'forwarded';
+  if (message.via_bot) return 'via-bot';
+  if (message.text != null) return typeof message.text === 'string' && message.text.startsWith(PREFIX) ? null : 'text-invalid';
+  // Acceptable media can only have been refused for its caption.
+  return telegramMedia(message) ? 'caption-invalid' : mediaRejection(message);
+}
+
+const megabytes = bytes => `${Math.round(bytes / (1024 * 1024))} MB`;
+const REJECTIONS = Object.freeze({
+  forwarded: 'Forwarded messages are not accepted, because only messages you send in this chat are authenticated. Send it directly instead.',
+  'via-bot': 'Messages sent through another bot are not accepted. Send it directly instead.',
+  'text-invalid': 'That message is empty, too long, or contains control characters.',
+  'caption-invalid': 'That attachment caption is too long or contains control characters.',
+  'audio-format': 'That audio format is not supported. Record a voice note, or send Ogg/Opus, MP3 or MP4 (M4A) audio.',
+  'audio-as-file': 'Audio sent as a file is not accepted. Record a voice note, or send it as an audio track instead.',
+  'video-format': 'That video format is not supported. Send an MP4, MOV or WebM clip.',
+  'video-as-file': 'Video sent as a file is not accepted. Send it as a video instead.',
+  'file-format': 'That file type is not supported. Send a photo, or a PDF, plain text, CSV or JSON file.',
+  'too-large': `That attachment is over the local limit (voice ${megabytes(MEDIA_LIMITS.voice)}, images ${megabytes(MEDIA_LIMITS.image)}, ` +
+    `files ${megabytes(MEDIA_LIMITS.document)}, video ${megabytes(MEDIA_LIMITS.video)}).`,
+  'too-short': 'That recording is shorter than one second.',
+  'too-long': `That recording is longer than the ${Math.round(MEDIA_LIMITS.voiceSeconds / 60)}-minute local limit.`,
+  unsupported: 'That kind of message is not supported here. Send text, a voice note, a photo, a supported file, or a video clip.'
+});
+const rejectionText = reason => `Not accepted: ${REJECTIONS[reason] ?? REJECTIONS.unsupported} Nothing was forwarded to Firstmate.`;
+
 export class TelegramDelegate {
   constructor({ store, adapter, clientFactory = config => new TelegramClient(config), clock = epoch, attachmentReader,
-    notificationAllowed = () => true, command = async () => null, transcribe, video }) {
-    Object.assign(this, { store, adapter, clientFactory, clock, attachmentReader, notificationAllowed, command, transcribe, video });
+    notificationAllowed = () => true, command = async () => null, transcribe, video, log = () => {} }) {
+    Object.assign(this, { store, adapter, clientFactory, clock, attachmentReader, notificationAllowed, command, transcribe, video, log });
     this.lastPoll = 0;
+    this.lastMediaFailure = null;
   }
   // Download, stage and describe one pending media job in place, so the rest of
   // the ordinary note path sees surrogate text exactly like a WhatsApp attachment.
-  // Returns false while the job must wait; after the final failed attempt the
-  // person is told once and the job retires.
+  // Returns false while the job must wait. Every failed attempt records and logs
+  // its stage; after the final one the person is told once what happened, the
+  // job (with its still-valid Telegram file id) moves to telegram-media-failed/
+  // for inspection, and retention ages it out.
   async resolveMedia(job, file, client) {
+    let phase = 'download', attachment;
     try {
       const metadata = { kind: job.media.kind, mime: job.media.mime, size: job.media.size, duration: job.media.duration,
         width: job.media.width ?? 0, height: job.media.height ?? 0, name: job.media.name };
       const source = await client.download(job.media.fileId, MEDIA_LIMITS[metadata.kind]);
-      const attachment = await stageInboundMedia(this.store, source, metadata);
+      phase = 'stage';
+      attachment = await stageInboundMedia(this.store, source, metadata);
+      phase = 'describe';
       job.text = await inboundMediaText(this.store, attachment, metadata,
         { transcribe: this.transcribe, transport: 'Telegram', caption: job.caption ?? '', video: this.video });
       job.attachment = { digest: attachment.digest, path: attachment.path };
       delete job.media;
       writeJson(file, job);
       return true;
-    } catch {
+    } catch (error) {
+      const at = this.clock(), stage = failureStage(phase, error);
       job.mediaAttempts = (job.mediaAttempts ?? 0) + 1;
+      job.mediaFailures = [...(Array.isArray(job.mediaFailures) ? job.mediaFailures : []),
+        { at, attempt: job.mediaAttempts, stage }].slice(-MEDIA_FAILURES_KEPT);
+      const { kind, mime, size, duration } = job.media;
+      this.log(`Telegram attachment ${job.remoteId} (${kind} ${mime}, ${size} bytes) failed at ${stage} (attempt ${job.mediaAttempts}/${MEDIA_ATTEMPTS})`);
       if (job.mediaAttempts >= MEDIA_ATTEMPTS) {
-        this.store.enqueue(MEDIA_FAILED, { kind: 'reply', session: '', id: `media-failed:${job.key}`, route: job.route, now: this.clock() });
-        this.store.markIncoming(job.key, this.clock(), { operation: 'media-failed', route: job.route });
+        const failure = { at, stage, kind, mime, size, duration, attempts: job.mediaAttempts };
+        const retained = this.store.file('telegram-media-failed'); privateDirectory(retained);
+        writeJson(path.join(retained, path.basename(file)), { ...job, failedAt: at, failure: { ...failure, staged: attachment?.path ?? null } });
+        this.store.enqueue(mediaFailedText(stage, Boolean(attachment)), { kind: 'reply', session: '', id: `media-failed:${job.key}`, route: job.route, now: at });
+        this.store.markIncoming(job.key, at, { operation: 'media-failed', route: job.route, failure });
+        this.lastMediaFailure = { ...failure, remoteId: job.remoteId };
         fs.unlinkSync(file);
       } else {
-        job.next = this.clock() + Math.min(300, 10 * 2 ** job.mediaAttempts);
+        job.next = at + Math.min(300, 10 * 2 ** job.mediaAttempts);
         writeJson(file, job);
       }
       return false;
     }
+  }
+  // Tell the paired person once why a message of theirs was not accepted. Best
+  // effort: an unqueueable explanation is logged, never allowed to stall intake.
+  refuse(message, reason, config) {
+    const key = telegramKey(config.route, message.message_id);
+    if (this.store.incoming(key)) return;
+    try {
+      this.store.enqueue(rejectionText(reason), { kind: 'reply', session: '', id: `unsupported:${key}`, route: config.route, now: this.clock() });
+      this.store.markIncoming(key, this.clock(), { operation: 'unsupported', route: config.route, reason });
+      this.log(`Telegram message TG_${message.message_id} from the paired person was not accepted (${reason}); explained once`);
+    } catch { this.log(`Telegram message TG_${message.message_id} was not accepted (${reason}); the explanation could not be queued`); }
   }
   async tick(whatsapp, snapshot) {
     let config;
@@ -252,6 +398,9 @@ export class TelegramDelegate {
             if (this.store.records('telegram-pending').length >= 100) break;
             const file = path.join(dir, `${incoming.key}.json`);
             if (!readJson(file)) writeJson(file, { ...incoming, route: config.route, attempts: 0, next: 0 });
+          } else if (!incoming) {
+            const reason = pairedRejection(update, config, this.clock());
+            if (reason) this.refuse(update.message, reason, config);
           }
           cursor.offset = update.update_id + 1;
           writeJson(cursorFile, cursor); // Accepted payload already durable before acknowledging server history.
@@ -353,7 +502,8 @@ export class TelegramDelegate {
         fs.unlinkSync(file);
         break;
       }
-      writeJson(this.store.file('telegram-health.json'), { at: this.clock(), problem: '', configured: true });
+      writeJson(this.store.file('telegram-health.json'), { at: this.clock(), problem: '', configured: true,
+        ...(this.lastMediaFailure ? { lastMediaFailure: this.lastMediaFailure } : {}) });
     } catch { writeJson(this.store.file('telegram-health.json'), { at: this.clock(), problem: 'Telegram unavailable; durable requests and responses retained' }); }
   }
 }
