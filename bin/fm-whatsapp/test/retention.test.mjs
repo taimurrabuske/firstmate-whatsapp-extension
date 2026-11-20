@@ -332,3 +332,30 @@ test('quarantine accounting counts records across buckets and ignores metadata s
   assert.equal(quarantineEntries(f.store, 'outbox').length, 1);
   assert.equal(quarantineEntries(f.store, 'incoming').length, 1);
 });
+
+test('failed Telegram media records age out past the horizon and doctor reports them', t => {
+  const f = fixture(t);
+  const now = RETENTION.seconds + 50_000;
+  const directory = f.store.file('telegram-media-failed');
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const record = (name, failedAt) => writeJson(path.join(directory, `${sha256(name)}.json`),
+    { key: sha256(name), media: { fileId: name }, failedAt, failure: { stage: 'getfile-timeout' } });
+  record('aged', now - RETENTION.seconds - 1); record('fresh', now - 10); record('untimed', undefined);
+  const report = retainPrivateState(f.store, null, { now });
+  assert.equal(report.mediaFailures, 1);
+  assert.deepEqual(f.store.records('telegram-media-failed').sort(), [sha256('fresh'), sha256('untimed')].map(key => `${key}.json`).sort());
+
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'fm-retention-doctor-media-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const home = path.join(base, 'home'); fs.mkdirSync(home);
+  const codeRoot = path.join(base, 'firstmate');
+  fs.mkdirSync(path.join(codeRoot, 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(codeRoot, 'bin/fm-afk-contract.sh'), '#!/bin/sh\n', { mode: 0o755 });
+  const store = new Store(home, path.join(base, 'delegate-state'));
+  fs.mkdirSync(store.file('telegram-media-failed'), { mode: 0o700 });
+  writeJson(store.file(`telegram-media-failed/${sha256('x')}.json`), { failedAt: 900, failure: { stage: 'download-http-404' } });
+  const result = doctorReport({ home, env: { FM_HOME: home, FM_CODE_ROOT: codeRoot, FM_DELEGATE_STATE: path.join(base, 'delegate-state') },
+    extensionRoot: root, transportReady: true, jqReady: true, processAlive: () => {} });
+  assert.match(result.lines.join('\n'), /1 Telegram attachment\(s\) could not be received in the last 30 days \(latest failed at download-http-404\)/);
+  assert.equal(result.ready, true);
+});

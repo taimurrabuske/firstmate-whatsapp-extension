@@ -246,6 +246,15 @@ export function doctorReport({ home, env = process.env, extensionRoot = root,
       if (unproved.length) problem(`${unproved.length} accepted request(s) could not be proved delivered to Firstmate; inspect their handoff receipts and Firstmate's pending and handled inbox; never delete a receipt or republish automatically`);
       else note(`${pendingQueue.total} accepted request(s) await processing; the bridge retries them automatically`);
     }
+    // Failed Telegram attachments: count and the closed failure stage only.
+    const mediaFailed = inventory('telegram-media-failed');
+    if (mediaFailed?.total) {
+      const latest = mediaFailed.files.map(name => safeRecord(path.join(directory, 'telegram-media-failed', name)))
+        .filter(record => Number.isFinite(record?.failedAt)).sort((a, b) => b.failedAt - a.failedAt)[0];
+      const stage = /^[a-z][a-z0-9-]{0,47}$/.test(latest?.failure?.stage ?? '') ? latest.failure.stage : 'unknown';
+      note(`${mediaFailed.total} Telegram attachment(s) could not be received in the last 30 days (latest failed at ${stage}); ` +
+        `their records are kept in ${path.join(directory, 'telegram-media-failed')} for inspection and the person was asked to resend`);
+    }
     const handoffs = inventory('handoffs');
     if (handoffs?.total) {
       const phaseCount = phase => handoffs.files.filter(name => safeRecord(path.join(directory, 'handoffs', name))?.phase === phase).length;
@@ -596,7 +605,7 @@ async function main(argv) {
       notificationAllowed: (job, snapshot, now) => policy.allow(job, snapshot, now),
       command: async text => { const result = policy.command(text); return result.recognized ? result.text : null; },
       attachmentReader: job => attachmentBytes(job, store),
-      transcribe: file => transcribeVoice(file, { store }) });
+      transcribe: file => transcribeVoice(file, { store }), log });
     bridge.disconnect('connecting');
     const silent = { level: 'silent', trace() {}, debug() {}, info() {}, warn() {}, error() {}, fatal() {}, child() { return this; } };
     const retry = () => {

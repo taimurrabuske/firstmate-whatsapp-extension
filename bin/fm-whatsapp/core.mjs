@@ -243,7 +243,9 @@ export class Store {
   records(name) { return fs.readdirSync(this.file(name)).filter(f => /^[a-f0-9]{64}\.json$/.test(f)).sort(); }
   incoming(key) { return readStoredRecord(this.root, this.file(`incoming/${key}.json`)).record; }
   markIncoming(key, now, request = {}) {
-    writeJson(this.file(`incoming/${key}.json`), { at: now, operation: request.operation, route: request.route, fallbackRoute: request.fallbackRoute });
+    // `reason` and `failure` are closed-vocabulary diagnostics (refusal reason, media failure stage), never message content.
+    writeJson(this.file(`incoming/${key}.json`), { at: now, operation: request.operation, route: request.route, fallbackRoute: request.fallbackRoute,
+      reason: request.reason, failure: request.failure });
   }
   currentRoute() {
     const account = readJson(this.file('identity.json'))?.account;
